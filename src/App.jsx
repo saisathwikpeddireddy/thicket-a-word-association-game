@@ -40,27 +40,67 @@ function fallbackWord(userWord, history) {
   return pool.find(w => !used.has(w)) || 'quiet';
 }
 
-async function claudeScoreGame(rounds, avgResponseMs) {
-  const transcript = rounds.map((r,i) => `${i+1}. Player: ${r.user} (${((r.userMs||0)/1000).toFixed(1)}s) → You: ${r.claude || '—'}`).join('\n');
+async function claudeScoreGame(rounds, avgResponseMs, seedWord) {
+  // Build turn-by-turn lines that make the prompt→response relationship explicit.
+  const lines = [];
+  let prevAi = seedWord || '(opening)';
+  rounds.forEach((r, i) => {
+    const t = ((r.userMs||0)/1000).toFixed(1);
+    lines.push(`Turn ${i+1}: AI said "${prevAi}" → player said "${r.user}" (after ${t}s)`);
+    if (r.claude) prevAi = r.claude;
+  });
+  const transcript = lines.join('\n');
   const userWords = rounds.map(r => r.user).filter(Boolean);
-  const prompt = `You just finished a 2-minute word-association improv game with a human.
+  const seenWords = new Set();
+  if (seedWord) seenWords.add(seedWord.toLowerCase());
+  const repeatFlags = rounds.map(r => {
+    const w = (r.user||'').toLowerCase();
+    const isRepeat = seenWords.has(w);
+    seenWords.add(w);
+    if (r.claude) seenWords.add(r.claude.toLowerCase());
+    return isRepeat;
+  });
+  const repeatNote = repeatFlags.some(Boolean)
+    ? `\nRepeated words (cap their score at 25): ${rounds.filter((_,i)=>repeatFlags[i]).map(r=>`"${r.user}"`).join(', ')}`
+    : '';
 
-Transcript:
-${transcript}
+  const prompt = `You are the Goldilocks judge for a word-association improv game. Score how well the PLAYER responded to each AI word — the sweet spot is surprising but inevitable.
 
-Stats:
-- Turns completed: ${rounds.length}
-- Avg response time: ${(avgResponseMs/1000).toFixed(1)}s
+Transcript (each line is the AI's word → the player's single-word response):
+${transcript}${repeatNote}
 
-Evaluate the PLAYER'S word choices on a "Goldilocks" axis — the sweet spot between too-obvious (dog→cat) and too-try-hard (dog→sepulchral). Surprising but inevitable.
+Player stats: ${rounds.length} turns, avg response ${(avgResponseMs/1000).toFixed(1)}s
 
-Return ONLY valid JSON, no code fences, no prose:
+RUBRIC — score each player word by how it responded to the AI word right before it:
+
+90-100  BRILLIANT. Sideways leap that reframes the chain. Plays on a second sense of the AI's word (pun, compound, idiom), or jumps register (abstract↔concrete) while staying coherent. Rare. Examples: music→cigar, hour→second, wrench→spanner→twist (the pivot from tool to motion).
+75-89   STRONG. Unexpected but clearly connected — not the first thing that comes to mind, but obvious in hindsight. Examples: chaos→carnival, rush→hour, potato→chip.
+60-74   SOLID. A real association with some creative reach — not trite, not trying too hard. Examples: cigar→smoke, disheveled→messy.
+45-59   PREDICTABLE. The first, most common link: category, synonym, rhyme, cliché pairing. Examples: light→shadow, sun→warm, loud→music, cold→shiver.
+25-44   WEAK. Rote reflex, stale cliché, or slightly off. Examples: sheep→wool (mechanical), trumpet→music (category).
+0-24    BROKEN. Unrelated, nonsense, or a repeated word from earlier in the chain.
+
+HARD RULES:
+- Any word already used earlier in the chain: hard cap 25.
+- The single most-common one-word association for the AI's word: cap 50.
+- Show-off word that a normal listener wouldn't accept as connected: cap 55.
+
+CONTEXT ADJUSTMENTS (apply AFTER the base score):
+- Player took >5s and delivered a rote/obvious word: subtract 10 (they had time to find better).
+- Player took <2s and delivered something 75+: add 5 (instinct reward).
+- A player word that sets up a great NEXT exchange (AI then lands on something rich): add 5.
+
+Now score. Be willing to use the full range — if a word is obvious, score it in the 40s. If it's brilliant, score 90+. Do NOT cluster everything around 60-70.
+
+The overall "quality" is NOT a simple average — it's a weighted judgment where weak words drag more than strong words lift (one cliché hurts the arc more than one gem saves it).
+
+Return ONLY valid JSON, no code fences:
 {
-  "quality": <integer 0-100, overall Goldilocks score>,
-  "perWord": [<integer 0-100 for each player word in order, exactly ${userWords.length} numbers>],
-  "standout": "<single word from their list that was the best association>",
-  "weakest": "<single word from their list that was the most obvious or try-hard, or empty string if none>",
-  "note": "<2-3 sentences of warm, specific coaching. Reference at least two actual words they chose (use these words exactly: ${userWords.slice(0,6).map(w=>`"${w}"`).join(', ')}). Sound like a thoughtful friend, not a grader. No exclamation marks.>"
+  "quality": <int 0-100, overall Goldilocks score — weak words drag this>,
+  "perWord": [<int 0-100 per player word, in order, exactly ${userWords.length} numbers>],
+  "standout": "<single best word from the player's list>",
+  "weakest": "<single weakest word from the player's list, or empty string if every word scored 65+>",
+  "note": "<2-3 sentences, warm and specific. Reference at least two actual words they chose (use exactly: ${userWords.slice(0,6).map(w=>`"${w}"`).join(', ')}). Sound like a thoughtful friend, not a grader. No exclamation marks.>"
 }`;
   try {
     const text = await callClaude({ prompt, task: 'score' });
@@ -318,7 +358,7 @@ function PlayScreen({ onEnd }) {
         clearInterval(id);
         const times = rounds.map(r => r.userMs).filter(Boolean);
         const avg = times.length ? times.reduce((a,b)=>a+b,0)/times.length : 0;
-        onEnd({ rounds, avgResponseMs: avg });
+        onEnd({ rounds, avgResponseMs: avg, seed });
       }
     }, 100);
     return () => clearInterval(id);
@@ -552,7 +592,7 @@ function PlayScreen({ onEnd }) {
                 endedRef.current = true;
                 const times = rounds.map(r => r.userMs).filter(Boolean);
                 const avg = times.length ? times.reduce((a,b)=>a+b,0)/times.length : 0;
-                onEnd({ rounds, avgResponseMs: avg });
+                onEnd({ rounds, avgResponseMs: avg, seed });
               }} className="mono" style={{
                 background: 'transparent', border: 'none', cursor: 'pointer',
                 fontSize: 11, letterSpacing: '0.18em', textTransform: 'uppercase',
@@ -656,7 +696,7 @@ function TrailWord({ word, who, index }) {
 
 // ---------- End Screen ----------
 
-function EndScreen({ rounds, avgResponseMs, onRestart }) {
+function EndScreen({ rounds, avgResponseMs, seed, onRestart }) {
   const [scoring, setScoring] = useState(true);
   const [scoreData, setScoreData] = useState(null);
   const [quality, setQuality] = useState(0);
@@ -667,7 +707,7 @@ function EndScreen({ rounds, avgResponseMs, onRestart }) {
     let cancelled = false;
     (async () => {
       await new Promise(r => setTimeout(r, 900));
-      const result = await claudeScoreGame(rounds, avgResponseMs);
+      const result = await claudeScoreGame(rounds, avgResponseMs, seed);
       if (cancelled) return;
       setScoreData(result);
       setScoring(false);
@@ -683,7 +723,7 @@ function EndScreen({ rounds, avgResponseMs, onRestart }) {
       tick();
     })();
     return () => { cancelled = true; };
-  }, [rounds, avgResponseMs]);
+  }, [rounds, avgResponseMs, seed]);
 
   useEffect(() => {
     if (scoring) return;
@@ -824,7 +864,7 @@ function EndScreen({ rounds, avgResponseMs, onRestart }) {
             }}>
               the journey · two minutes
             </div>
-            <Journey rounds={rounds} perWord={scoreData?.perWord || []} standout={scoreData?.standout} weakest={scoreData?.weakest} />
+            <Journey rounds={rounds} perWord={scoreData?.perWord || []} standout={scoreData?.standout} weakest={scoreData?.weakest} seed={seed} />
           </div>
         )}
 
@@ -920,29 +960,61 @@ function qualityColor(q) {
   return 'var(--clay)';
 }
 
-function Journey({ rounds, perWord, standout, weakest }) {
+function Journey({ rounds, perWord, standout, weakest, seed }) {
   const [hover, setHover] = useState(null);
   const totalMs = GAME_SECONDS * 1000;
 
-  const events = [];
-  let userIdx = 0;
-  rounds.forEach((r, i) => {
+  // User turns, each paired with the AI word that preceded it.
+  const userTurns = [];
+  let prevAi = seed || null;
+  rounds.forEach((r) => {
     if (typeof r.userAt === 'number') {
-      events.push({
-        type: 'user', word: r.user, t: r.userAt, dur: r.userMs || 0,
-        quality: perWord[userIdx], idx: userIdx,
-        isStandout: standout && standout === r.user,
-        isWeakest: weakest && weakest === r.user,
+      userTurns.push({
+        idx: userTurns.length,
+        word: r.user,
+        prevAi,
+        claude: r.claude,
+        quality: typeof perWord[userTurns.length] === 'number' ? perWord[userTurns.length] : 55,
+        timeMs: r.userMs || 0,
+        atMs: r.userAt,
       });
-      userIdx++;
     }
-    if (r.claude && typeof r.claudeAt === 'number') {
-      events.push({ type: 'claude', word: r.claude, t: r.claudeAt, dur: 0 });
-    }
+    if (r.claude) prevAi = r.claude;
   });
 
-  const maxDur = Math.max(1000, ...events.filter(e => e.type==='user').map(e => e.dur));
-  const longestPause = events.filter(e => e.type==='user').reduce((best, e) => e.dur > (best?.dur || 0) ? e : best, null);
+  const claudeTurns = rounds
+    .filter(r => r.claude && typeof r.claudeAt === 'number')
+    .map(r => ({ word: r.claude, atMs: r.claudeAt }));
+
+  const maxTimeMs = Math.max(3000, ...userTurns.map(t => t.timeMs));
+  const longestPause = userTurns.reduce((b, t) => !b || t.timeMs > b.timeMs ? t : b, null);
+  const peak = userTurns.reduce((b, t) => !b || t.quality > b.quality ? t : b, null);
+  const valley = userTurns.reduce((b, t) => !b || t.quality < b.quality ? t : b, null);
+
+  // SVG geometry — fixed viewBox, scales to container width.
+  const W = 1000;
+  const qualityH = 150;
+  const axisY = qualityH;
+  const timeH = 70;
+  const H = qualityH + timeH + 36;
+  const PAD_L = 32, PAD_R = 18;
+  const plotW = W - PAD_L - PAD_R;
+
+  const xAt = (ms) => PAD_L + (plotW * Math.min(Math.max(ms, 0), totalMs)) / totalMs;
+  const qualityY = (q) => 8 + (qualityH - 16) * (1 - q / 100);
+  const timeBarH = (ms) => Math.max(1, (ms / maxTimeMs) * (timeH - 14));
+
+  // Quality line and area path
+  let pathD = '';
+  userTurns.forEach((t, i) => {
+    const cmd = i === 0 ? 'M' : 'L';
+    pathD += `${cmd} ${xAt(t.atMs).toFixed(1)} ${qualityY(t.quality).toFixed(1)} `;
+  });
+  const areaD = userTurns.length > 0
+    ? `${pathD} L ${xAt(userTurns[userTurns.length-1].atMs).toFixed(1)} ${axisY} L ${xAt(userTurns[0].atMs).toFixed(1)} ${axisY} Z`
+    : '';
+
+  const active = hover !== null ? userTurns[hover] : null;
 
   return (
     <div style={{
@@ -951,125 +1023,225 @@ function Journey({ rounds, perWord, standout, weakest }) {
       border: '1px solid var(--line)',
       borderRadius: 3,
     }}>
-      <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', marginBottom: 14, alignItems: 'center' }}>
+      {/* Legend */}
+      <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', marginBottom: 10, alignItems: 'center' }}>
         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-          <span style={{ width: 12, height: 12, borderRadius: '50%', background: 'var(--user-tint)', border: '1.5px solid var(--user-line)' }}/>
-          <span className="mono" style={{ fontSize: 10, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--stone)', fontWeight: 500 }}>your words · size = time spent</span>
+          <span style={{ width: 18, height: 2, background: 'var(--moss)' }}/>
+          <span className="mono" style={{ fontSize: 10, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--stone)', fontWeight: 500 }}>word quality (0–100)</span>
         </span>
         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-          <LeafIcon size={10} color="var(--claude-ink)"/>
+          <span style={{ width: 5, height: 14, background: 'var(--user-line)', borderRadius: 1 }}/>
+          <span className="mono" style={{ fontSize: 10, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--stone)', fontWeight: 500 }}>time spent</span>
+        </span>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ width: 8, height: 8, borderRadius: '50%', background: 'var(--paper)', border: '1px solid var(--claude-line)' }}/>
           <span className="mono" style={{ fontSize: 10, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--stone)', fontWeight: 500 }}>claude replies</span>
         </span>
       </div>
 
-      <div style={{ position: 'relative', height: 160, marginTop: 24 }}>
-        <div style={{ position: 'absolute', left: 0, right: 0, top: '50%', height: 1, background: 'var(--line)' }}/>
+      {/* Main chart */}
+      <div style={{ position: 'relative' }}>
+        <svg viewBox={`0 0 ${W} ${H}`} width="100%" style={{ display: 'block', overflow: 'visible' }}>
+          {/* Quality gridlines */}
+          {[0, 25, 50, 75, 100].map(q => (
+            <g key={q}>
+              <line x1={PAD_L} y1={qualityY(q)} x2={W - PAD_R} y2={qualityY(q)}
+                stroke="var(--line-soft)" strokeWidth="1"
+                strokeDasharray={q === 0 || q === 100 ? '0' : '2 5'}
+                opacity={q === 0 ? 0.6 : 0.35}/>
+              <text x={PAD_L - 6} y={qualityY(q) + 3} fontSize="10"
+                fill="var(--stone)" textAnchor="end"
+                fontFamily="Geist Mono, ui-monospace, monospace"
+                fontVariantNumeric="tabular-nums">
+                {q}
+              </text>
+            </g>
+          ))}
 
-        {[0, 30, 60, 90, 120].map(s => (
-          <div key={s} style={{ position: 'absolute', left: `${(s/GAME_SECONDS)*100}%`, top: 0, bottom: 0 }}>
-            <div style={{ width: 1, height: '100%', background: 'var(--line-soft)' }}/>
-            <div className="mono" style={{
-              position: 'absolute', top: '100%', left: 0, transform: 'translateX(-50%)',
-              fontSize: 10, color: 'var(--stone)', fontWeight: 500, marginTop: 6,
-              fontVariantNumeric: 'tabular-nums',
-            }}>
-              {Math.floor(s/60)}:{String(s%60).padStart(2,'0')}
-            </div>
-          </div>
-        ))}
+          {/* Goldilocks band (60-80) */}
+          <rect x={PAD_L} y={qualityY(80)} width={plotW} height={qualityY(60) - qualityY(80)}
+            fill="var(--moss-soft)" opacity="0.1"/>
+          <text x={W - PAD_R - 4} y={qualityY(80) + 12} fontSize="9"
+            fill="var(--moss-deep)" textAnchor="end" fontStyle="italic"
+            fontFamily="Lora, Georgia, serif" opacity="0.7">
+            goldilocks zone
+          </text>
 
-        {events.map((e, i) => {
-          const x = Math.min(100, (e.t / totalMs) * 100);
-          const isUser = e.type === 'user';
-          const size = isUser ? 10 + (e.dur / maxDur) * 20 : 6;
-          const quality = e.quality ?? 55;
-          const yOffset = isUser ? -(quality - 50) * 0.7 : 18;
-          const color = isUser ? qualityColor(quality) : 'var(--claude-line)';
-          return (
-            <React.Fragment key={i}>
-              {isUser && (
-                <div style={{
-                  position: 'absolute', left: `${x}%`, top: '50%',
-                  width: 1, height: Math.abs(yOffset),
-                  background: 'var(--line)',
-                  transform: `translateX(-50%) translateY(${yOffset < 0 ? yOffset : 0}px)`,
-                }}/>
-              )}
-              <div
-                onMouseEnter={() => setHover(i)}
-                onMouseLeave={() => setHover(null)}
-                style={{
-                  position: 'absolute',
-                  left: `${x}%`, top: '50%',
-                  width: size, height: size, borderRadius: '50%',
-                  background: isUser ? color : 'transparent',
-                  border: isUser ? `1.5px solid ${color}` : `1.5px solid var(--claude-line)`,
-                  transform: `translate(-50%, calc(-50% + ${yOffset}px))`,
-                  cursor: 'pointer',
-                  transition: 'transform 200ms ease, box-shadow 200ms ease',
-                  boxShadow: hover === i ? `0 0 0 4px ${isUser ? 'var(--user-tint)' : 'var(--claude-tint)'}` : 'none',
-                  zIndex: hover === i ? 10 : 2,
-                  animation: `fade-in 600ms ease ${i * 40}ms both`,
-                }}
-              />
-              {e.isStandout && (
-                <div style={{
-                  position: 'absolute', left: `${x}%`, top: '50%',
-                  transform: `translate(-50%, calc(-50% + ${yOffset}px - ${size/2 + 14}px))`,
-                  color: 'var(--moss-deep)',
-                }}>
-                  <LeafIcon size={12} />
-                </div>
-              )}
-            </React.Fragment>
-          );
-        })}
+          {/* Axis line */}
+          <line x1={PAD_L} y1={axisY} x2={W - PAD_R} y2={axisY}
+            stroke="var(--line)" strokeWidth="1"/>
 
-        {hover !== null && events[hover] && (() => {
-          const e = events[hover];
-          const x = Math.min(100, (e.t / totalMs) * 100);
-          const isLeft = x > 70;
+          {/* Time-axis marks (0:00, 0:30, 1:00, 1:30, 2:00) */}
+          {[0, 30, 60, 90, 120].map(s => {
+            const x = xAt(s * 1000);
+            return (
+              <g key={s}>
+                <line x1={x} y1={4} x2={x} y2={axisY + timeH}
+                  stroke="var(--line-soft)" strokeWidth="1" strokeDasharray="1 5" opacity="0.45"/>
+                <line x1={x} y1={axisY - 3} x2={x} y2={axisY + 3}
+                  stroke="var(--line)" strokeWidth="1"/>
+                <text x={x} y={H - 6} fontSize="10"
+                  fill="var(--stone)" textAnchor="middle"
+                  fontFamily="Geist Mono, ui-monospace, monospace"
+                  fontVariantNumeric="tabular-nums">
+                  {Math.floor(s/60)}:{String(s%60).padStart(2,'0')}
+                </text>
+              </g>
+            );
+          })}
+
+          {/* Quality area fill */}
+          {areaD && <path d={areaD} fill="var(--moss-soft)" opacity="0.18"/>}
+
+          {/* Quality line */}
+          {pathD && <path d={pathD} fill="none" stroke="var(--moss)" strokeWidth="1.6"
+            strokeLinejoin="round" strokeLinecap="round" opacity="0.75"/>}
+
+          {/* Time bars (below axis) */}
+          {userTurns.map((t, i) => {
+            const x = xAt(t.atMs);
+            const h = timeBarH(t.timeMs);
+            const isLongest = longestPause && longestPause.idx === t.idx;
+            return (
+              <rect key={`tb-${i}`}
+                x={x - 2.2} y={axisY + 1} width="4.4" height={h}
+                fill={isLongest ? 'var(--clay)' : 'var(--user-line)'}
+                opacity={isLongest ? 0.9 : 0.55}
+                rx="1.5"/>
+            );
+          })}
+
+          {/* Longest-pause time label */}
+          {longestPause && (
+            <text x={xAt(longestPause.atMs)} y={axisY + timeBarH(longestPause.timeMs) + 12}
+              fontSize="10" fill="var(--clay)" textAnchor="middle"
+              fontFamily="Geist Mono, ui-monospace, monospace"
+              fontVariantNumeric="tabular-nums" fontWeight="500">
+              {(longestPause.timeMs/1000).toFixed(1)}s
+            </text>
+          )}
+
+          {/* Claude reply markers on axis */}
+          {claudeTurns.map((c, i) => (
+            <circle key={`c-${i}`} cx={xAt(c.atMs)} cy={axisY}
+              r="2.6" fill="var(--paper)" stroke="var(--claude-line)" strokeWidth="1.2"/>
+          ))}
+
+          {/* User word connectors + dots */}
+          {userTurns.map((t, i) => {
+            const x = xAt(t.atMs);
+            const y = qualityY(t.quality);
+            const isStandout = standout && standout === t.word;
+            const isWeakest = weakest && weakest === t.word;
+            const isActive = hover === i;
+            const r = isActive ? 6.5 : (isStandout || isWeakest ? 5.2 : 4);
+            const color = qualityColor(t.quality);
+            return (
+              <g key={`u-${i}`}>
+                <line x1={x} y1={axisY} x2={x} y2={y}
+                  stroke={color} strokeWidth="1" opacity="0.22"/>
+                <circle cx={x} cy={y} r={r}
+                  fill="var(--paper)" stroke={color} strokeWidth="1.6"/>
+                <circle cx={x} cy={y} r={Math.max(1.5, r - 2)}
+                  fill={color} opacity={isStandout ? 1 : 0.82}/>
+                <circle cx={x} cy={y} r="14"
+                  fill="transparent"
+                  onMouseEnter={() => setHover(i)}
+                  onMouseLeave={() => setHover(null)}
+                  style={{ cursor: 'pointer' }}/>
+              </g>
+            );
+          })}
+
+          {/* Standout leaf marker */}
+          {standout && peak && peak.word === standout && (
+            <g transform={`translate(${xAt(peak.atMs) - 6}, ${qualityY(peak.quality) - 20})`} opacity="0.85">
+              <path d="M6 11 C 6 7, 3 5, 2 2 C 5 2, 9 4, 10 7 C 10 9, 8 11, 6 11 Z"
+                fill="var(--moss-deep)"/>
+            </g>
+          )}
+        </svg>
+
+        {/* Hover tooltip */}
+        {active && (() => {
+          const xPct = (xAt(active.atMs) / W) * 100;
+          const isRight = xPct > 70;
           return (
             <div style={{
-              position: 'absolute', left: `${x}%`, top: '50%',
-              transform: `translate(${isLeft ? '-100%' : '0'}, -50%) translateX(${isLeft ? -12 : 12}px)`,
+              position: 'absolute',
+              left: `${xPct}%`, top: 0,
+              transform: `translateX(${isRight ? '-100%' : '0'})`,
+              marginLeft: isRight ? -12 : 12, marginTop: 8,
               background: 'var(--paper)',
               border: '1px solid var(--line)',
-              padding: '10px 12px',
+              padding: '10px 13px',
               borderRadius: 3,
-              minWidth: 140,
+              minWidth: 180,
               boxShadow: '0 8px 24px -12px rgba(42,39,32,0.3)',
               zIndex: 20,
               pointerEvents: 'none',
             }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
-                <SpeakerPill who={e.type} />
-              </div>
-              <div className="serif" style={{
-                fontSize: 20, fontWeight: 400,
-                fontStyle: e.type === 'claude' ? 'italic' : 'normal',
-                color: e.type === 'claude' ? 'var(--claude-ink)' : 'var(--ink)',
-                lineHeight: 1.1, marginBottom: 4,
-              }}>{e.word}</div>
               <div className="mono" style={{
-                fontSize: 10, color: 'var(--stone)', letterSpacing: '0.1em', textTransform: 'uppercase',
-                fontVariantNumeric: 'tabular-nums',
+                fontSize: 9, color: 'var(--stone)', letterSpacing: '0.14em',
+                textTransform: 'uppercase', fontWeight: 500, marginBottom: 6,
               }}>
-                at {Math.floor(e.t/60000)}:{String(Math.floor((e.t%60000)/1000)).padStart(2,'0')}
-                {e.type === 'user' && ` · ${(e.dur/1000).toFixed(1)}s`}
-                {e.type === 'user' && typeof e.quality === 'number' && (
-                  <span style={{ color: qualityColor(e.quality), marginLeft: 8 }}>· q{e.quality}</span>
-                )}
+                turn {active.idx + 1}
+              </div>
+              {active.prevAi && (
+                <div className="serif" style={{
+                  fontSize: 13, color: 'var(--claude-ink)', fontStyle: 'italic',
+                  marginBottom: 2, display: 'flex', alignItems: 'center', gap: 5,
+                }}>
+                  <LeafIcon size={10} color="var(--claude-ink)"/> {active.prevAi}
+                </div>
+              )}
+              <div className="serif" style={{
+                fontSize: 22, color: 'var(--ink)', fontWeight: 400,
+                lineHeight: 1.1, marginBottom: 6,
+              }}>{active.word}</div>
+              <div className="mono" style={{
+                fontSize: 10, color: 'var(--stone)', letterSpacing: '0.08em',
+                fontVariantNumeric: 'tabular-nums',
+                display: 'flex', gap: 10, flexWrap: 'wrap',
+              }}>
+                <span>{(active.timeMs/1000).toFixed(1)}s</span>
+                <span style={{ color: qualityColor(active.quality), fontWeight: 500 }}>q{active.quality}</span>
+                <span>@ {Math.floor(active.atMs/60000)}:{String(Math.floor((active.atMs%60000)/1000)).padStart(2,'0')}</span>
               </div>
             </div>
           );
         })()}
       </div>
 
+      {/* Summary cards */}
       <div style={{
-        marginTop: 36, paddingTop: 16, borderTop: '1px solid var(--line-soft)',
-        display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 16,
+        marginTop: 8, paddingTop: 16, borderTop: '1px solid var(--line-soft)',
+        display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 16,
       }}>
+        {peak && (
+          <div>
+            <div className="mono" style={{ fontSize: 10, letterSpacing: '0.18em', textTransform: 'uppercase', color: 'var(--stone)', fontWeight: 500, marginBottom: 4 }}>
+              peak
+            </div>
+            <div className="serif" style={{ fontSize: 18, color: 'var(--moss-deep)', fontWeight: 400, display: 'flex', alignItems: 'baseline', gap: 8 }}>
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                <LeafIcon size={13} color="var(--moss-deep)"/> {peak.word}
+              </span>
+              <span className="mono" style={{ fontSize: 11, color: 'var(--stone)', fontVariantNumeric: 'tabular-nums' }}>q{peak.quality}</span>
+            </div>
+          </div>
+        )}
+        {valley && peak && valley.idx !== peak.idx && (
+          <div>
+            <div className="mono" style={{ fontSize: 10, letterSpacing: '0.18em', textTransform: 'uppercase', color: 'var(--stone)', fontWeight: 500, marginBottom: 4 }}>
+              most obvious
+            </div>
+            <div className="serif" style={{ fontSize: 18, color: 'var(--clay)', fontWeight: 400, display: 'flex', alignItems: 'baseline', gap: 8 }}>
+              {valley.word}
+              <span className="mono" style={{ fontSize: 11, color: 'var(--stone)', fontVariantNumeric: 'tabular-nums' }}>q{valley.quality}</span>
+            </div>
+          </div>
+        )}
         {longestPause && (
           <div>
             <div className="mono" style={{ fontSize: 10, letterSpacing: '0.18em', textTransform: 'uppercase', color: 'var(--stone)', fontWeight: 500, marginBottom: 4 }}>
@@ -1077,29 +1249,9 @@ function Journey({ rounds, perWord, standout, weakest }) {
             </div>
             <div className="serif" style={{ fontSize: 18, color: 'var(--ink)', fontWeight: 400 }}>
               before <em style={{ color: 'var(--moss-deep)' }}>{longestPause.word}</em>
-              <span className="mono" style={{ fontSize: 12, color: 'var(--stone)', marginLeft: 8 }}>
-                {(longestPause.dur/1000).toFixed(1)}s
+              <span className="mono" style={{ fontSize: 12, color: 'var(--stone)', marginLeft: 6, fontVariantNumeric: 'tabular-nums' }}>
+                {(longestPause.timeMs/1000).toFixed(1)}s
               </span>
-            </div>
-          </div>
-        )}
-        {standout && (
-          <div>
-            <div className="mono" style={{ fontSize: 10, letterSpacing: '0.18em', textTransform: 'uppercase', color: 'var(--stone)', fontWeight: 500, marginBottom: 4 }}>
-              standout
-            </div>
-            <div className="serif" style={{ fontSize: 18, color: 'var(--moss-deep)', fontWeight: 400, display: 'flex', alignItems: 'center', gap: 6 }}>
-              <LeafIcon size={14} color="var(--moss-deep)"/> {standout}
-            </div>
-          </div>
-        )}
-        {weakest && (
-          <div>
-            <div className="mono" style={{ fontSize: 10, letterSpacing: '0.18em', textTransform: 'uppercase', color: 'var(--stone)', fontWeight: 500, marginBottom: 4 }}>
-              most obvious
-            </div>
-            <div className="serif" style={{ fontSize: 18, color: 'var(--clay)', fontWeight: 400 }}>
-              {weakest}
             </div>
           </div>
         )}
@@ -1303,6 +1455,7 @@ export default function App() {
         <EndScreen
           rounds={result.rounds}
           avgResponseMs={result.avgResponseMs}
+          seed={result.seed}
           onRestart={() => { setResult(null); setScreen('start'); }}
         />
       )}
