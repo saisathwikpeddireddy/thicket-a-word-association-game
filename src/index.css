@@ -1,0 +1,152 @@
+:root {
+  --paper: #F1ECDD;
+  --paper-2: #EAE3D0;
+  --paper-3: #DDD4BD;
+  --ink: #1F1C15;
+  --ink-soft: #3A342A;
+  --stone: #6E6858;
+  --stone-2: #8A8372;
+  --moss: #556542;
+  --moss-deep: #364229;
+  --moss-soft: #7A8864;
+  --clay: #B86F4A;
+  --lichen: #C8C3A8;
+  --line: rgba(31,28,21,0.16);
+  --line-soft: rgba(31,28,21,0.08);
+  --grain: 0.35;
+  --text-scale: 1;
+  --claude-style: italic;
+
+  --user-ink: #5A4A2F;
+  --user-tint: rgba(184, 152, 95, 0.14);
+  --user-line: rgba(148, 115, 60, 0.55);
+  --claude-ink: #364229;
+  --claude-tint: rgba(92, 107, 71, 0.12);
+  --claude-line: rgba(75, 90, 55, 0.55);
+}
+
+[data-contrast="high"] {
+  --ink: #171410;
+  --ink-soft: #2A241C;
+  --stone: #5A5445;
+  --stone-2: #766F5E;
+  --line: rgba(23,20,16,0.22);
+  --line-soft: rgba(23,20,16,0.11);
+}
+
+[data-palette="bark"] {
+  --paper: #EFE8D6;
+  --moss: #5A3F2A;
+  --moss-deep: #3A2716;
+  --moss-soft: #8C6A4E;
+}
+[data-palette="clay"] {
+  --moss: #9E4F30;
+  --moss-deep: #6E3418;
+  --moss-soft: #C48465;
+}
+[data-palette="slate"] {
+  --moss: #3D4A52;
+  --moss-deep: #242E34;
+  --moss-soft: #6F7E87;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0; padding: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: "Newsreader", Georgia, serif;
+  font-optical-sizing: auto;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  min-height: 100vh;
+}
+
+@media (max-width: 760px) {
+  html, body { overflow-x: hidden; }
+}
+
+body::before {
+  content: "";
+  position: fixed; inset: 0;
+  pointer-events: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0.16  0 0 0 0 0.15  0 0 0 0 0.12  0 0 0 0.35 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)' opacity='0.35'/></svg>");
+  opacity: var(--grain);
+  mix-blend-mode: multiply;
+  z-index: 1;
+}
+
+body::after {
+  content: "";
+  position: fixed; inset: 0;
+  pointer-events: none;
+  background: radial-gradient(ellipse at 20% 10%, rgba(255,248,220,0.25), transparent 55%),
+              radial-gradient(ellipse at 85% 95%, rgba(60,70,45,0.08), transparent 50%);
+  z-index: 1;
+}
+
+#root { position: relative; z-index: 2; min-height: 100vh; }
+
+.hide-on-narrow { display: block; }
+@media (max-width: 640px) {
+  .hide-on-narrow { display: none !important; }
+}
+
+.mono { font-family: "Geist Mono", ui-monospace, monospace; font-feature-settings: "ss01"; }
+.serif { font-family: "Newsreader", Georgia, serif; }
+
+button:focus-visible, input:focus-visible {
+  outline: 1.5px solid var(--moss);
+  outline-offset: 3px;
+}
+
+::selection { background: rgba(92,107,71,0.25); }
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-thumb { background: var(--stone-2); border-radius: 3px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+@keyframes breathe {
+  0%, 100% { opacity: 0.45; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.25); }
+}
+@keyframes word-arrive {
+  0% { opacity: 0; transform: translateY(12px); filter: blur(8px); }
+  100% { opacity: 1; transform: translateY(0); filter: blur(0); }
+}
+@keyframes line-sweep {
+  0% { transform: scaleX(0); opacity: 0; }
+  40% { opacity: 1; }
+  100% { transform: scaleX(1); opacity: 0; }
+}
+@keyframes word-settle {
+  0% { opacity: 0; transform: translateX(-6px); filter: blur(2px); }
+  100% { opacity: 1; transform: translateX(0); filter: blur(0); }
+}
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes thinking {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 0.8; }
+}
+@keyframes cursor-blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+@keyframes sway {
+  0%, 100% { transform: rotate(-4deg); }
+  50% { transform: rotate(4deg); }
+}
+@keyframes drift {
+  0%, 100% { transform: translate(0, 0); opacity: 0.15; }
+  50% { transform: translate(30px, -40px); opacity: 0.5; }
+}
+@keyframes fall {
+  0% { transform: translateY(-10px) rotate(0deg); opacity: 0; }
+  10% { opacity: 0.7; }
+  100% { transform: translateY(120px) rotate(180deg); opacity: 0; }
+}
