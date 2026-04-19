@@ -7,6 +7,18 @@ const MODELS = {
   score: 'claude-sonnet-4-5',
 };
 
+// Higher token budget on scoring now that per-word reasons are returned.
+const MAX_TOKENS = {
+  word: 20,
+  score: 2200,
+};
+
+// Deterministic scoring; playful word generation.
+const TEMPERATURE = {
+  word: 0.9,
+  score: 0,
+};
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     res.status(405).json({ error: 'method not allowed' });
@@ -23,14 +35,17 @@ export default async function handler(req, res) {
   if (typeof body === 'string') {
     try { body = JSON.parse(body); } catch { body = {}; }
   }
-  const { prompt, task } = body || {};
+  const { prompt, task, temperature } = body || {};
   if (!prompt || typeof prompt !== 'string') {
     res.status(400).json({ error: 'missing prompt' });
     return;
   }
 
   const model = MODELS[task] || MODELS.word;
-  const maxTokens = task === 'score' ? 600 : 20;
+  const maxTokens = MAX_TOKENS[task] || MAX_TOKENS.word;
+  const temp = typeof temperature === 'number'
+    ? Math.max(0, Math.min(1, temperature))
+    : (TEMPERATURE[task] ?? 0.7);
 
   try {
     const anthropicRes = await fetch('https://api.anthropic.com/v1/messages', {
@@ -43,6 +58,7 @@ export default async function handler(req, res) {
       body: JSON.stringify({
         model,
         max_tokens: maxTokens,
+        temperature: temp,
         messages: [{ role: 'user', content: prompt }],
       }),
     });

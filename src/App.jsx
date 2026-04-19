@@ -40,98 +40,146 @@ function fallbackWord(userWord, history) {
   return pool.find(w => !used.has(w)) || 'quiet';
 }
 
-async function claudeScoreGame(rounds, avgResponseMs, seedWord) {
-  // Build turn-by-turn lines that make the prompt→response relationship explicit.
-  const lines = [];
-  let prevAi = seedWord || '(opening)';
-  rounds.forEach((r, i) => {
-    const t = ((r.userMs||0)/1000).toFixed(1);
-    lines.push(`Turn ${i+1}: AI said "${prevAi}" → player said "${r.user}" (after ${t}s)`);
-    if (r.claude) prevAi = r.claude;
-  });
-  const transcript = lines.join('\n');
-  const userWords = rounds.map(r => r.user).filter(Boolean);
-  const seenWords = new Set();
-  if (seedWord) seenWords.add(seedWord.toLowerCase());
-  const repeatFlags = rounds.map(r => {
-    const w = (r.user||'').toLowerCase();
-    const isRepeat = seenWords.has(w);
-    seenWords.add(w);
-    if (r.claude) seenWords.add(r.claude.toLowerCase());
+// Client-side repeat detection (independent of the LLM).
+function detectRepeats(rounds, seedWord) {
+  const seen = new Set();
+  if (seedWord) seen.add(seedWord.toLowerCase().trim());
+  const flags = rounds.map((r) => {
+    const w = (r.user || '').toLowerCase().trim();
+    const isRepeat = seen.has(w) && !!w;
+    seen.add(w);
+    if (r.claude) seen.add(r.claude.toLowerCase().trim());
     return isRepeat;
   });
-  const repeatNote = repeatFlags.some(Boolean)
-    ? `\nRepeated words (cap their score at 25): ${rounds.filter((_,i)=>repeatFlags[i]).map(r=>`"${r.user}"`).join(', ')}`
-    : '';
+  return flags;
+}
 
-  const prompt = `You are the Goldilocks judge for a word-association improv game. Score how well the PLAYER responded to each AI word — the sweet spot is surprising but inevitable.
+async function claudeScoreGame(rounds, avgResponseMs, seedWord) {
+  const userWords = rounds.map(r => r.user).filter(Boolean);
+  const repeatFlags = detectRepeats(rounds, seedWord);
 
-Transcript (each line is the AI's word → the player's single-word response):
-${transcript}${repeatNote}
+  // Build the transcript with unambiguous speaker labels so the LLM
+  // never mixes up who said what.
+  const lines = [];
+  let prevAi = seedWord || null;
+  lines.push(`(game opens with AI word: ${seedWord ? `"${seedWord}"` : '(none)'})`);
+  rounds.forEach((r, i) => {
+    const t = ((r.userMs||0)/1000).toFixed(1);
+    const repeatMark = repeatFlags[i] ? ' [REPEAT of an earlier word in this chain — hard cap 25]' : '';
+    lines.push(`Turn ${i+1}: AI="${prevAi || '?'}" → PLAYER="${r.user}" (${t}s)${repeatMark}`);
+    if (r.claude) {
+      lines.push(`         → AI reply="${r.claude}"`);
+      prevAi = r.claude;
+    }
+  });
+  const transcript = lines.join('\n');
+
+  const prompt = `You are the Goldilocks judge for a word-association improv game. You score how well the PLAYER responded to each AI word. The sweet spot is "surprising but inevitable" — not the most obvious link, not a try-hard curiosity.
+
+IMPORTANT — WHO SAID WHAT:
+- "AI=..." is a word the AI said.
+- "PLAYER=..." is the word the human player said in response.
+- You are ONLY scoring PLAYER words. Never attribute an AI word to the player.
+
+Transcript:
+${transcript}
 
 Player stats: ${rounds.length} turns, avg response ${(avgResponseMs/1000).toFixed(1)}s
 
-RUBRIC — score each player word by how it responded to the AI word right before it:
+RUBRIC — for each PLAYER word, score how it responded to the AI word immediately before it:
+  90-100  BRILLIANT  Sideways leap that reframes the chain. Plays on a second sense (pun/compound/idiom), or jumps register (abstract↔concrete) while staying coherent. Rare. Examples: music→cigar, hour→second (as in "second wind"), wish→cancer (emotional pivot), chaos→carnival.
+  75-89   STRONG     Unexpected but clearly connected. Obvious in hindsight, not on first impulse. Examples: rush→hour, potato→chip, spanner→twist.
+  60-74   SOLID      A real association with creative reach. Not trite, not try-hard. Examples: cigar→smoke, disheveled→messy.
+  45-59   PREDICTABLE  First, most common link: category, synonym, rhyme, cliché pairing. Examples: light→shadow, sun→warm, loud→music, cold→shiver, fast→blur.
+  25-44   WEAK       Rote reflex, stale cliché. Examples: sheep→wool (mechanical), trumpet→music (category).
+  0-24    BROKEN     Unrelated, nonsense, or REPEATED from earlier in the chain.
 
-90-100  BRILLIANT. Sideways leap that reframes the chain. Plays on a second sense of the AI's word (pun, compound, idiom), or jumps register (abstract↔concrete) while staying coherent. Rare. Examples: music→cigar, hour→second, wrench→spanner→twist (the pivot from tool to motion).
-75-89   STRONG. Unexpected but clearly connected — not the first thing that comes to mind, but obvious in hindsight. Examples: chaos→carnival, rush→hour, potato→chip.
-60-74   SOLID. A real association with some creative reach — not trite, not trying too hard. Examples: cigar→smoke, disheveled→messy.
-45-59   PREDICTABLE. The first, most common link: category, synonym, rhyme, cliché pairing. Examples: light→shadow, sun→warm, loud→music, cold→shiver.
-25-44   WEAK. Rote reflex, stale cliché, or slightly off. Examples: sheep→wool (mechanical), trumpet→music (category).
-0-24    BROKEN. Unrelated, nonsense, or a repeated word from earlier in the chain.
+HARD CAPS:
+- Word already used earlier in the chain (marked [REPEAT]): hard cap 25.
+- The single most-common one-word association: cap 50.
+- Obscure show-off a normal listener wouldn't accept: cap 55.
 
-HARD RULES:
-- Any word already used earlier in the chain: hard cap 25.
-- The single most-common one-word association for the AI's word: cap 50.
-- Show-off word that a normal listener wouldn't accept as connected: cap 55.
+CONTEXT ADJUSTMENTS (after base):
+- Took >5s and delivered rote/obvious: −10 (they had time to find better).
+- Took <2s and delivered 75+: +5 (instinct reward).
+- Word that visibly sets up a rich next exchange: +5.
 
-CONTEXT ADJUSTMENTS (apply AFTER the base score):
-- Player took >5s and delivered a rote/obvious word: subtract 10 (they had time to find better).
-- Player took <2s and delivered something 75+: add 5 (instinct reward).
-- A player word that sets up a great NEXT exchange (AI then lands on something rich): add 5.
+DISTRIBUTION REQUIREMENT — be willing to use the full range. If you find yourself clustering scores in the 55–65 band, you are under-scoring. Look at each word hard: is it the FIRST response anyone would give to the AI word? Then it is 45–55, not 65. Is it a true creative leap? Then score 80+. Never return more than half the words within a 10-point band.
 
-Now score. Be willing to use the full range — if a word is obvious, score it in the 40s. If it's brilliant, score 90+. Do NOT cluster everything around 60-70.
+OVERALL — "quality" is weighted so weak words drag more than strong words lift. A single cliché hurts the arc more than a single gem saves it.
 
-The overall "quality" is NOT a simple average — it's a weighted judgment where weak words drag more than strong words lift (one cliché hurts the arc more than one gem saves it).
+REASONS — for each word, write a tight phrase (max 8 words) saying WHY it got that score. Speak directly to the player: "first synonym that comes to mind", "brave emotional leap", "rhyme reflex", "fresh compound play", "solid but common".
 
-Return ONLY valid JSON, no code fences:
+ALTERNATIVE — for the weakest word (if any), suggest ONE alternative single word that would have scored 75+ from the same AI prompt. Just the word.
+
+COACHING NOTE — exactly 2 sentences, warm, specific. The FIRST names one real strength (quote two of the player's words exactly). The SECOND names one pattern to try next round, concrete. No exclamation marks. No generic advice ("trust yourself"). Quote words using these exact tokens: ${userWords.slice(0,8).map(w=>`"${w}"`).join(', ')}.
+
+Return ONLY valid JSON, no code fences, no prose outside the object:
 {
-  "quality": <int 0-100, overall Goldilocks score — weak words drag this>,
-  "perWord": [<int 0-100 per player word, in order, exactly ${userWords.length} numbers>],
-  "standout": "<single best word from the player's list>",
-  "weakest": "<single weakest word from the player's list, or empty string if every word scored 65+>",
-  "note": "<2-3 sentences, warm and specific. Reference at least two actual words they chose (use exactly: ${userWords.slice(0,6).map(w=>`"${w}"`).join(', ')}). Sound like a thoughtful friend, not a grader. No exclamation marks.>"
+  "quality": <int 0-100>,
+  "perWord": [<int 0-100, exactly ${userWords.length} numbers, in order>],
+  "reasons": [<string, exactly ${userWords.length} short phrases, in order, each ≤8 words>],
+  "standout": "<single best PLAYER word from their list>",
+  "standoutWhy": "<one short phrase explaining why it was the best leap>",
+  "weakest": "<single weakest PLAYER word, or empty string if every word scored 65+>",
+  "weakestAlt": "<one alternative single word that would have scored 75+ from that AI prompt, or empty>",
+  "note": "<exactly 2 sentences following the COACHING NOTE rules above>"
 }`;
+
   try {
     const text = await callClaude({ prompt, task: 'score' });
     const match = text.match(/\{[\s\S]*\}/);
     if (match) {
       const parsed = JSON.parse(match[0]);
       let perWord = Array.isArray(parsed.perWord) ? parsed.perWord.map(n => Math.max(0, Math.min(100, parseInt(n)||50))) : [];
-      while (perWord.length < userWords.length) perWord.push(parsed.quality || 60);
+      while (perWord.length < userWords.length) perWord.push(parsed.quality || 55);
       perWord = perWord.slice(0, userWords.length);
+      // Apply client-side repeat caps as a safety net.
+      perWord = perWord.map((q, i) => repeatFlags[i] ? Math.min(q, 25) : q);
+
+      let reasons = Array.isArray(parsed.reasons) ? parsed.reasons.map(r => String(r || '').trim()) : [];
+      while (reasons.length < userWords.length) reasons.push('');
+      reasons = reasons.slice(0, userWords.length);
+
       return {
         quality: Math.max(0, Math.min(100, parseInt(parsed.quality) || 50)),
         perWord,
+        reasons,
         standout: String(parsed.standout || '').toLowerCase().trim(),
+        standoutWhy: String(parsed.standoutWhy || '').trim(),
         weakest: String(parsed.weakest || '').toLowerCase().trim(),
-        note: String(parsed.note || '').trim()
+        weakestAlt: String(parsed.weakestAlt || '').toLowerCase().trim(),
+        note: String(parsed.note || '').trim(),
+        repeatFlags,
       };
     }
   } catch(e) {}
-  const perWord = rounds.map(r => {
+
+  // Local fallback — maps response time to a band (less clustered than before).
+  const perWord = rounds.map((r, i) => {
+    if (repeatFlags[i]) return 22;
     const s = (r.userMs || 3000) / 1000;
-    if (s < 1.5) return 45 + Math.random() * 15;
-    if (s < 4) return 60 + Math.random() * 20;
-    if (s < 8) return 65 + Math.random() * 20;
-    return 55 + Math.random() * 20;
-  }).map(n => Math.round(n));
+    let base;
+    if (s < 1.2) base = 50;
+    else if (s < 2.5) base = 62;
+    else if (s < 5) base = 65;
+    else if (s < 9) base = 58;
+    else base = 52;
+    return base + Math.round((Math.random() - 0.5) * 14);
+  }).map(n => Math.max(0, Math.min(100, n)));
+
+  const maxIdx = perWord.indexOf(Math.max(...perWord));
+  const minIdx = perWord.indexOf(Math.min(...perWord));
   return {
-    quality: 62,
+    quality: Math.round(perWord.reduce((a,b)=>a+b,0) / (perWord.length || 1)),
     perWord,
-    standout: userWords[Math.floor(userWords.length/2)] || '',
-    weakest: '',
-    note: `You found some lovely turns — ${userWords[0] || 'your first word'} opened a door, and ${userWords[Math.floor(userWords.length/2)] || 'the middle'} kept it honest. Next time, trust the second thought a little more than the first.`
+    reasons: perWord.map(q => q >= 70 ? 'felt earned' : q >= 55 ? 'solid link' : 'first-impulse pick'),
+    standout: userWords[maxIdx] || '',
+    standoutWhy: 'the one that turned a corner',
+    weakest: perWord[minIdx] < 55 ? (userWords[minIdx] || '') : '',
+    weakestAlt: '',
+    note: `You kept the chain honest through ${userWords[0] || 'the opening'} and ${userWords[Math.min(2, userWords.length-1)] || 'the middle'}. Next round, when an AI word has two meanings, try the less-obvious one first.`,
+    repeatFlags,
   };
 }
 
@@ -701,7 +749,10 @@ function EndScreen({ rounds, avgResponseMs, seed, onRestart }) {
   const [scoreData, setScoreData] = useState(null);
   const [quality, setQuality] = useState(0);
   const [typed, setTyped] = useState('');
-  const [revealed, setRevealed] = useState({ turns: false, quality: false, time: false, journey: false });
+  const [activeIdx, setActiveIdx] = useState(null);
+  const [history, setHistory] = useState(() => loadHistory());
+  const [shareState, setShareState] = useState('idle'); // idle | copied | failed
+  const savedRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -711,6 +762,18 @@ function EndScreen({ rounds, avgResponseMs, seed, onRestart }) {
       if (cancelled) return;
       setScoreData(result);
       setScoring(false);
+      // Save the run once, so StrictMode double-invokes don't double-log.
+      if (!savedRef.current) {
+        savedRef.current = true;
+        const entry = {
+          t: Date.now(),
+          quality: result.quality,
+          turns: rounds.filter(r => r.claude).length,
+          avgMs: avgResponseMs,
+        };
+        setHistory(saveHistoryEntry(entry));
+      }
+      // Animate the score count-up.
       const target = result.quality;
       const startAt = Date.now();
       const dur = 1400;
@@ -725,15 +788,6 @@ function EndScreen({ rounds, avgResponseMs, seed, onRestart }) {
     return () => { cancelled = true; };
   }, [rounds, avgResponseMs, seed]);
 
-  useEffect(() => {
-    if (scoring) return;
-    const t1 = setTimeout(() => setRevealed(r => ({ ...r, turns: true })), 200);
-    const t2 = setTimeout(() => setRevealed(r => ({ ...r, quality: true })), 700);
-    const t3 = setTimeout(() => setRevealed(r => ({ ...r, time: true })), 1200);
-    const t4 = setTimeout(() => setRevealed(r => ({ ...r, journey: true })), 1700);
-    return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); clearTimeout(t4); };
-  }, [scoring]);
-
   const note = scoreData?.note || '';
   useEffect(() => {
     if (!note) return;
@@ -745,12 +799,39 @@ function EndScreen({ rounds, avgResponseMs, seed, onRestart }) {
         if (i >= note.length) clearInterval(id);
       }, 26);
       return () => clearInterval(id);
-    }, 2200);
+    }, 1600);
     return () => clearTimeout(startDelay);
   }, [note]);
 
   const turnsCompleted = rounds.filter(r => r.claude).length;
   const avgSec = (avgResponseMs/1000).toFixed(1);
+  const band = scoreData ? scoreBand(scoreData.quality) : null;
+
+  // Delta vs. the previous run, and personal best flag.
+  // history[last] is the just-saved current run, so previous is [last-1].
+  const prevEntry = history.length >= 2 ? history[history.length - 2] : null;
+  const delta = scoreData && prevEntry ? scoreData.quality - prevEntry.quality : null;
+  const best = scoreData && history.length
+    ? history.reduce((m, h) => h.quality > m ? h.quality : m, 0)
+    : null;
+  const isBest = scoreData && best !== null && scoreData.quality >= best && history.length > 1;
+
+  const userTurns = useMemo(() => buildUserTurns({
+    rounds,
+    perWord: scoreData?.perWord || [],
+    reasons: scoreData?.reasons || [],
+    seed,
+    repeatFlags: scoreData?.repeatFlags || [],
+  }), [rounds, scoreData, seed]);
+
+  const longestPause = userTurns.reduce((b, t) => !b || t.timeMs > b.timeMs ? t : b, null);
+
+  const handleShare = async () => {
+    const text = buildShareText({ rounds, seed, scoreData, avgResponseMs });
+    const ok = await copyToClipboard(text);
+    setShareState(ok ? 'copied' : 'failed');
+    setTimeout(() => setShareState('idle'), 1800);
+  };
 
   return (
     <div style={{
@@ -764,6 +845,7 @@ function EndScreen({ rounds, avgResponseMs, seed, onRestart }) {
         padding: 'clamp(40px, 6vw, 64px) clamp(20px, 4vw, 48px)',
         position: 'relative', zIndex: 2,
       }}>
+        {/* Eyebrow */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 18 }}>
           <div className="mono" style={{
             fontSize: 12, letterSpacing: '0.2em', textTransform: 'uppercase',
@@ -775,35 +857,84 @@ function EndScreen({ rounds, avgResponseMs, seed, onRestart }) {
           <span style={{ color: 'var(--moss-soft)' }}><LeafIcon size={16} sway /></span>
         </div>
 
+        {/* Verdict-first headline */}
         <h2 className="serif" style={{
           fontSize: 'clamp(36px, 5.5vw, 56px)',
           fontWeight: 400, fontStyle: 'italic',
           lineHeight: 1.05, letterSpacing: '-0.02em',
-          color: 'var(--ink)',
-          margin: '0 0 40px',
-          maxWidth: 720, textWrap: 'pretty',
+          color: band ? band.tone : 'var(--ink)',
+          margin: '0 0 18px',
+          maxWidth: 780, textWrap: 'pretty',
+          transition: 'color 800ms ease',
         }}>
-          {scoring ? 'Claude is reading back through the trail' : 'Here is what the trail looked like'}
+          {scoring ? 'Reading back through the trail' : (band?.headline || 'Here is what the trail looked like')}
           <span style={{ color: 'var(--moss)' }}>.</span>
         </h2>
 
-        <div className="metrics-grid">
-          <MetricCard
-            label="turns completed" value={turnsCompleted} unit=""
-            revealed={revealed.turns} hint={turnsHint(turnsCompleted)}
-          />
-          <MetricCard
-            label="word quality" value={scoring ? '—' : quality}
-            unit={scoring ? '' : '/ 100'} revealed={revealed.quality}
-            hint="the goldilocks" accent loading={scoring}
-          />
-          <MetricCard
-            label="avg response" value={scoring ? '—' : avgSec} unit="sec"
-            revealed={revealed.time} hint={timeHint(parseFloat(avgSec))}
-          />
+        {/* Score row with band, delta, and best marker */}
+        <div style={{
+          display: 'flex', alignItems: 'baseline', gap: 24, flexWrap: 'wrap',
+          marginBottom: 40, paddingBottom: 28, borderBottom: '1px solid var(--line)',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+            <span className="serif" style={{
+              fontSize: 'clamp(72px, 9vw, 104px)',
+              fontWeight: 400, letterSpacing: '-0.04em', lineHeight: 0.9,
+              color: band?.tone || 'var(--ink)',
+              fontVariantNumeric: 'tabular-nums',
+              animation: scoring ? 'thinking 1.4s ease-in-out infinite' : 'none',
+            }}>
+              {scoring ? '—' : quality}
+            </span>
+            <span className="mono" style={{
+              fontSize: 13, letterSpacing: '0.16em', textTransform: 'uppercase',
+              color: 'var(--stone)', fontWeight: 500,
+            }}>/ 100</span>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {band && (
+              <span className="mono" style={{
+                fontSize: 11, color: band.tone, letterSpacing: '0.22em',
+                textTransform: 'uppercase', fontWeight: 600,
+              }}>
+                {band.label}
+              </span>
+            )}
+            <div className="mono" style={{
+              fontSize: 11, color: 'var(--stone)', letterSpacing: '0.14em',
+              fontVariantNumeric: 'tabular-nums', display: 'flex', gap: 14,
+              flexWrap: 'wrap', textTransform: 'uppercase',
+            }}>
+              <span>{turnsCompleted} turns</span>
+              <span>avg {avgSec}s · {timeHint(parseFloat(avgSec))}</span>
+              {delta !== null && (
+                <span style={{
+                  color: delta > 0 ? 'var(--moss-deep)' : delta < 0 ? 'var(--clay)' : 'var(--stone)',
+                  fontWeight: 600,
+                }}>
+                  {delta > 0 ? '+' : ''}{delta} vs last
+                </span>
+              )}
+              {isBest && (
+                <span style={{ color: 'var(--moss-deep)', fontWeight: 600 }}>new best</span>
+              )}
+            </div>
+          </div>
         </div>
 
-        <div style={{ marginTop: 56, maxWidth: 740 }}>
+        {/* Standout callout */}
+        {!scoring && scoreData?.standout && (
+          <div style={{ marginBottom: 32 }}>
+            <StandoutCallout
+              standout={scoreData.standout}
+              standoutWhy={scoreData.standoutWhy}
+              userTurns={userTurns}
+            />
+          </div>
+        )}
+
+        {/* Coaching note */}
+        <div style={{ marginBottom: 36, maxWidth: 740 }}>
           <div className="mono" style={{
             fontSize: 12, letterSpacing: '0.2em', textTransform: 'uppercase',
             color: 'var(--stone)', marginBottom: 14, fontWeight: 500,
@@ -813,9 +944,9 @@ function EndScreen({ rounds, avgResponseMs, seed, onRestart }) {
             <span>a note for you</span>
           </div>
           <div className="serif" style={{
-            fontSize: 'clamp(20px, 2.6vw, 26px)', lineHeight: 1.5, fontWeight: 400,
+            fontSize: 'clamp(18px, 2.2vw, 22px)', lineHeight: 1.5, fontWeight: 400,
             color: 'var(--ink)',
-            minHeight: 80,
+            minHeight: 64,
             fontStyle: 'var(--claude-style, italic)',
             textWrap: 'pretty',
             paddingLeft: 16, borderLeft: '2px solid var(--claude-line)',
@@ -836,11 +967,12 @@ function EndScreen({ rounds, avgResponseMs, seed, onRestart }) {
           </div>
         </div>
 
-        <div style={{ marginTop: 48, display: 'flex', gap: 20, alignItems: 'center', flexWrap: 'wrap' }}>
+        {/* Actions */}
+        <div style={{ marginBottom: 48, display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
           <button onClick={onRestart} style={{
             background: 'var(--moss)', color: 'var(--paper)',
-            border: 'none', padding: '16px 32px',
-            fontFamily: 'inherit', fontSize: 17, fontWeight: 500, letterSpacing: '0.02em',
+            border: 'none', padding: '14px 28px',
+            fontFamily: 'inherit', fontSize: 16, fontWeight: 500, letterSpacing: '0.02em',
             cursor: 'pointer', borderRadius: 2,
             transition: 'background 400ms ease',
           }}
@@ -849,106 +981,75 @@ function EndScreen({ rounds, avgResponseMs, seed, onRestart }) {
           >
             Another round
           </button>
+          <button onClick={handleShare} disabled={scoring} style={{
+            background: 'transparent', color: 'var(--ink-soft)',
+            border: '1px solid var(--line)',
+            padding: '13px 22px',
+            fontFamily: 'inherit', fontSize: 15, fontWeight: 500, letterSpacing: '0.02em',
+            cursor: scoring ? 'default' : 'pointer', borderRadius: 2,
+            opacity: scoring ? 0.4 : 1,
+            transition: 'color 300ms ease, border-color 300ms ease',
+          }}>
+            {shareState === 'copied' ? 'copied ✓' : shareState === 'failed' ? 'copy failed' : 'Share trail'}
+          </button>
         </div>
 
-        {rounds.length > 0 && (
-          <div style={{
-            marginTop: 56,
-            opacity: revealed.journey ? 1 : 0,
-            transform: revealed.journey ? 'translateY(0)' : 'translateY(10px)',
-            transition: 'opacity 900ms ease, transform 900ms cubic-bezier(0.2,0.8,0.2,1)',
-          }}>
+        {/* Arc chart */}
+        {!scoring && userTurns.length > 0 && (
+          <div style={{ marginBottom: 40 }}>
             <div className="mono" style={{
               fontSize: 12, letterSpacing: '0.2em', textTransform: 'uppercase',
-              color: 'var(--stone)', marginBottom: 18, fontWeight: 500,
+              color: 'var(--stone)', marginBottom: 14, fontWeight: 500,
             }}>
-              the journey · two minutes
+              the arc · two minutes
             </div>
-            <Journey rounds={rounds} perWord={scoreData?.perWord || []} standout={scoreData?.standout} weakest={scoreData?.weakest} seed={seed} />
+            <ArcChart
+              userTurns={userTurns}
+              seed={seed}
+              activeIdx={activeIdx}
+              setActiveIdx={setActiveIdx}
+              standout={scoreData?.standout}
+              weakest={scoreData?.weakest}
+              longestPause={longestPause}
+            />
           </div>
         )}
 
-        {rounds.length > 0 && (
-          <div style={{ marginTop: 56 }}>
+        {/* Time vs. quality */}
+        {!scoring && userTurns.length >= 3 && (
+          <div style={{ marginBottom: 40 }}>
+            <TimeQualityScatter userTurns={userTurns} />
+          </div>
+        )}
+
+        {/* Exchange cards */}
+        {!scoring && userTurns.length > 0 && (
+          <div style={{ marginBottom: 24 }}>
             <div className="mono" style={{
               fontSize: 12, letterSpacing: '0.2em', textTransform: 'uppercase',
-              color: 'var(--stone)', marginBottom: 18, fontWeight: 500,
+              color: 'var(--stone)', marginBottom: 14, fontWeight: 500,
             }}>
-              the trail, in full
+              the exchange
             </div>
-            <div className="transcript-grid">
-              {(() => {
-                const items = [];
-                let userIdx = 0;
-                rounds.forEach((r, i) => {
-                  items.push({ who: 'user', word: r.user, n: i*2+1, quality: scoreData?.perWord?.[userIdx], seconds: (r.userMs||0)/1000 });
-                  userIdx++;
-                  if (r.claude) items.push({ who: 'claude', word: r.claude, n: i*2+2 });
-                });
-                return items.map((it, idx) => (
-                  <div key={idx} style={{
-                    display: 'flex', alignItems: 'center', gap: 10,
-                    padding: '10px 12px',
-                    background: it.who === 'user' ? 'var(--user-tint)' : 'var(--claude-tint)',
-                    border: `1px solid ${it.who === 'user' ? 'var(--user-line)' : 'var(--claude-line)'}`,
-                    borderRadius: 3,
-                    animation: `fade-in 500ms ease ${idx * 30}ms both`,
-                  }}>
-                    <span className="mono" style={{
-                      fontSize: 10, color: 'var(--stone)', fontWeight: 500,
-                      fontVariantNumeric: 'tabular-nums', width: 18, flexShrink: 0,
-                    }}>
-                      {String(it.n).padStart(2,'0')}
-                    </span>
-                    <span style={{ flexShrink: 0 }}>
-                      {it.who === 'user' ? <SeedIcon size={11} color="var(--user-ink)"/> : <LeafIcon size={11} color="var(--claude-ink)"/>}
-                    </span>
-                    <span className="serif" style={{
-                      flex: 1,
-                      fontSize: 17, fontWeight: 400,
-                      fontStyle: it.who === 'claude' ? 'var(--claude-style, italic)' : 'normal',
-                      color: it.who === 'claude' ? 'var(--claude-ink)' : 'var(--ink)',
-                      letterSpacing: '-0.01em',
-                      wordBreak: 'break-word',
-                    }}>
-                      {it.word}
-                    </span>
-                    {it.who === 'user' && typeof it.quality === 'number' && (
-                      <span className="mono" style={{
-                        fontSize: 10, color: qualityColor(it.quality), fontWeight: 500,
-                        fontVariantNumeric: 'tabular-nums', flexShrink: 0,
-                      }} title={`quality ${it.quality} · ${it.seconds.toFixed(1)}s`}>
-                        {it.quality}
-                      </span>
-                    )}
-                  </div>
-                ));
-              })()}
-            </div>
+            <ExchangeCards
+              userTurns={userTurns}
+              activeIdx={activeIdx}
+              setActiveIdx={setActiveIdx}
+              standout={scoreData?.standout}
+              weakest={scoreData?.weakest}
+            />
+            {scoreData?.weakest && scoreData?.weakestAlt && (
+              <div className="serif" style={{
+                marginTop: 14, fontSize: 14, fontStyle: 'italic',
+                color: 'var(--stone)', paddingLeft: 12,
+                borderLeft: '2px solid var(--line)',
+              }}>
+                instead of <strong style={{ color: 'var(--clay)' }}>{scoreData.weakest}</strong>, you could have tried <strong style={{ color: 'var(--moss-deep)' }}>{scoreData.weakestAlt}</strong>.
+              </div>
+            )}
           </div>
         )}
       </div>
-
-      <style>{`
-        .metrics-grid {
-          display: grid;
-          grid-template-columns: repeat(3, 1fr);
-          gap: 2px;
-          background: var(--line);
-          border-top: 1px solid var(--line);
-          border-bottom: 1px solid var(--line);
-        }
-        .transcript-grid {
-          display: grid;
-          grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-          gap: 8px;
-        }
-        @media (max-width: 640px) {
-          .metrics-grid {
-            grid-template-columns: 1fr;
-          }
-        }
-      `}</style>
     </div>
   );
 }
@@ -960,61 +1061,224 @@ function qualityColor(q) {
   return 'var(--clay)';
 }
 
-function Journey({ rounds, perWord, standout, weakest, seed }) {
-  const [hover, setHover] = useState(null);
-  const totalMs = GAME_SECONDS * 1000;
+// Maps a score to its rubric band label. Keeps copy honest — a 58
+// is not "the goldilocks zone", it's just below it.
+function scoreBand(q) {
+  if (q >= 85) return { label: 'brilliant', headline: 'You found the clearing.', tone: 'var(--moss-deep)' };
+  if (q >= 70) return { label: 'strong',    headline: 'You hit the Goldilocks zone.', tone: 'var(--moss-deep)' };
+  if (q >= 55) return { label: 'solid',     headline: 'You kept it solid.', tone: 'var(--moss)' };
+  if (q >= 40) return { label: 'first-path',headline: 'You took the first path most times.', tone: 'var(--stone)' };
+  return { label: 'rough', headline: 'A shaky round — plenty to climb next time.', tone: 'var(--clay)' };
+}
 
-  // User turns, each paired with the AI word that preceded it.
-  const userTurns = [];
+// Label for a single score reflecting the rubric bands (not just a comparison).
+function wordBandLabel(q) {
+  if (q >= 90) return 'brilliant';
+  if (q >= 75) return 'strong';
+  if (q >= 60) return 'solid';
+  if (q >= 45) return 'predictable';
+  if (q >= 25) return 'weak';
+  return 'broken';
+}
+
+// Score history lives in localStorage. We only keep the last 20 runs.
+const HISTORY_KEY = 'thicket:history:v1';
+function loadHistory() {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = window.localStorage.getItem(HISTORY_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr.filter(e => e && typeof e.quality === 'number') : [];
+  } catch { return []; }
+}
+function saveHistoryEntry(entry) {
+  if (typeof window === 'undefined') return [];
+  try {
+    const hist = loadHistory();
+    hist.push(entry);
+    const trimmed = hist.slice(-20);
+    window.localStorage.setItem(HISTORY_KEY, JSON.stringify(trimmed));
+    return trimmed;
+  } catch { return []; }
+}
+
+// Pearson correlation between two arrays (same length).
+function correlation(xs, ys) {
+  const n = Math.min(xs.length, ys.length);
+  if (n < 3) return 0;
+  let mx = 0, my = 0;
+  for (let i = 0; i < n; i++) { mx += xs[i]; my += ys[i]; }
+  mx /= n; my /= n;
+  let num = 0, dx = 0, dy = 0;
+  for (let i = 0; i < n; i++) {
+    const ax = xs[i] - mx, ay = ys[i] - my;
+    num += ax * ay; dx += ax * ax; dy += ay * ay;
+  }
+  const denom = Math.sqrt(dx * dy);
+  return denom ? num / denom : 0;
+}
+
+// Turn the correlation between time-taken and quality into a human sentence.
+function timeQualityInsight(r) {
+  if (Math.abs(r) < 0.2) return 'Taking longer didn\'t change much — instinct was about as good as deliberation.';
+  if (r > 0.5)  return 'The extra seconds clearly paid off — your slower words scored noticeably higher.';
+  if (r > 0.2)  return 'Slower answers scored a little better — deliberation helped, modestly.';
+  if (r < -0.5) return 'Your quickest answers were your strongest — overthinking seemed to hurt.';
+  return 'Faster answers scored a little better — your first instincts were onto something.';
+}
+
+// Clipboard helper with a tiny visible confirmation state.
+async function copyToClipboard(text) {
+  try {
+    if (navigator?.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  } catch { return false; }
+}
+
+function buildShareText({ rounds, seed, scoreData, avgResponseMs }) {
+  const lines = [];
+  lines.push(`Thicket — word association`);
+  lines.push(`quality ${scoreData?.quality ?? '—'}/100 · ${rounds.length} turns · avg ${(avgResponseMs/1000).toFixed(1)}s`);
+  lines.push('');
+  const trail = [];
+  if (seed) trail.push(seed);
+  rounds.forEach(r => {
+    if (r.user) trail.push(r.user);
+    if (r.claude) trail.push(r.claude);
+  });
+  lines.push(trail.join(' → '));
+  if (scoreData?.standout) lines.push('');
+  if (scoreData?.standout) lines.push(`best leap: ${scoreData.standout}${scoreData.standoutWhy ? ` — ${scoreData.standoutWhy}` : ''}`);
+  return lines.join('\n');
+}
+
+// Build a unified per-user-turn array with everything downstream
+// components need. userTurns[0].prevAi is the seed (the AI's opener).
+function buildUserTurns({ rounds, perWord, reasons, seed, repeatFlags }) {
+  const out = [];
   let prevAi = seed || null;
   rounds.forEach((r) => {
-    if (typeof r.userAt === 'number') {
-      userTurns.push({
-        idx: userTurns.length,
-        word: r.user,
-        prevAi,
-        claude: r.claude,
-        quality: typeof perWord[userTurns.length] === 'number' ? perWord[userTurns.length] : 55,
-        timeMs: r.userMs || 0,
-        atMs: r.userAt,
-      });
-    }
+    if (!r.user) return;
+    const idx = out.length;
+    out.push({
+      idx,
+      word: r.user,
+      prevAi,
+      claudeReply: r.claude || null,
+      quality: typeof perWord?.[idx] === 'number' ? perWord[idx] : 55,
+      reason: reasons?.[idx] || '',
+      timeMs: r.userMs || 0,
+      atMs: typeof r.userAt === 'number' ? r.userAt : 0,
+      claudeAt: typeof r.claudeAt === 'number' ? r.claudeAt : null,
+      isRepeat: !!repeatFlags?.[idx],
+    });
     if (r.claude) prevAi = r.claude;
   });
+  return out;
+}
 
-  const claudeTurns = rounds
-    .filter(r => r.claude && typeof r.claudeAt === 'number')
-    .map(r => ({ word: r.claude, atMs: r.claudeAt }));
+// Featured moment — the standout leap, shown prominently above the chart.
+function StandoutCallout({ standout, standoutWhy, userTurns }) {
+  const match = userTurns.find(t => t.word === standout);
+  if (!match) return null;
+  return (
+    <div style={{
+      padding: 'clamp(20px, 2.6vw, 28px)',
+      background: 'var(--moss-soft)',
+      border: '1px solid var(--moss-soft)',
+      borderRadius: 4,
+      position: 'relative',
+      overflow: 'hidden',
+    }}>
+      <div className="mono" style={{
+        fontSize: 10, letterSpacing: '0.22em', textTransform: 'uppercase',
+        color: 'var(--moss-deep)', fontWeight: 500, marginBottom: 12,
+        display: 'flex', alignItems: 'center', gap: 8,
+      }}>
+        <LeafIcon size={12} color="var(--moss-deep)" sway /> best leap
+      </div>
+      <div className="serif" style={{
+        fontSize: 'clamp(22px, 3vw, 30px)', lineHeight: 1.25, fontWeight: 400,
+        color: 'var(--ink)', letterSpacing: '-0.015em', marginBottom: 10,
+        display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap',
+      }}>
+        {match.prevAi && (
+          <span style={{ color: 'var(--claude-ink)', fontStyle: 'italic' }}>
+            {match.prevAi}
+          </span>
+        )}
+        {match.prevAi && <span style={{ color: 'var(--stone)' }}>→</span>}
+        <span style={{ color: 'var(--moss-deep)', fontWeight: 500 }}>{match.word}</span>
+        <span className="mono" style={{
+          fontSize: 12, color: 'var(--moss-deep)',
+          fontVariantNumeric: 'tabular-nums',
+        }}>
+          q{match.quality}
+        </span>
+      </div>
+      {standoutWhy && (
+        <div className="serif" style={{
+          fontSize: 16, fontStyle: 'italic', color: 'var(--ink-soft)',
+          lineHeight: 1.45, maxWidth: 620,
+        }}>
+          {standoutWhy}
+        </div>
+      )}
+    </div>
+  );
+}
 
+// The arc — quality over time, with linked hover/focus state.
+function ArcChart({ userTurns, seed, activeIdx, setActiveIdx, standout, weakest, longestPause }) {
+  const totalMs = GAME_SECONDS * 1000;
   const maxTimeMs = Math.max(3000, ...userTurns.map(t => t.timeMs));
-  const longestPause = userTurns.reduce((b, t) => !b || t.timeMs > b.timeMs ? t : b, null);
-  const peak = userTurns.reduce((b, t) => !b || t.quality > b.quality ? t : b, null);
-  const valley = userTurns.reduce((b, t) => !b || t.quality < b.quality ? t : b, null);
 
-  // SVG geometry — fixed viewBox, scales to container width.
   const W = 1000;
-  const qualityH = 150;
+  const qualityH = 170;
   const axisY = qualityH;
-  const timeH = 70;
+  const timeH = 58;
   const H = qualityH + timeH + 36;
-  const PAD_L = 32, PAD_R = 18;
+  const PAD_L = 34, PAD_R = 20;
   const plotW = W - PAD_L - PAD_R;
 
   const xAt = (ms) => PAD_L + (plotW * Math.min(Math.max(ms, 0), totalMs)) / totalMs;
-  const qualityY = (q) => 8 + (qualityH - 16) * (1 - q / 100);
-  const timeBarH = (ms) => Math.max(1, (ms / maxTimeMs) * (timeH - 14));
+  const qualityY = (q) => 10 + (qualityH - 22) * (1 - q / 100);
+  // Sqrt scale so short pauses remain visible.
+  const timeBarH = (ms) => {
+    if (ms <= 0) return 1;
+    const s = Math.sqrt(ms / maxTimeMs);
+    return Math.max(2, s * (timeH - 12));
+  };
 
-  // Quality line and area path
   let pathD = '';
   userTurns.forEach((t, i) => {
-    const cmd = i === 0 ? 'M' : 'L';
-    pathD += `${cmd} ${xAt(t.atMs).toFixed(1)} ${qualityY(t.quality).toFixed(1)} `;
+    pathD += `${i === 0 ? 'M' : 'L'} ${xAt(t.atMs).toFixed(1)} ${qualityY(t.quality).toFixed(1)} `;
   });
-  const areaD = userTurns.length > 0
+  const areaD = userTurns.length
     ? `${pathD} L ${xAt(userTurns[userTurns.length-1].atMs).toFixed(1)} ${axisY} L ${xAt(userTurns[0].atMs).toFixed(1)} ${axisY} Z`
     : '';
 
-  const active = hover !== null ? userTurns[hover] : null;
+  const active = typeof activeIdx === 'number' ? userTurns[activeIdx] : null;
+
+  // Claude's words to label above the axis (including the seed at t=0).
+  const claudeWords = [];
+  if (seed) claudeWords.push({ word: seed, atMs: 0, isSeed: true });
+  userTurns.forEach(t => {
+    if (t.claudeReply && typeof t.claudeAt === 'number') {
+      claudeWords.push({ word: t.claudeReply, atMs: t.claudeAt });
+    }
+  });
 
   return (
     <div style={{
@@ -1027,21 +1291,21 @@ function Journey({ rounds, perWord, standout, weakest, seed }) {
       <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', marginBottom: 10, alignItems: 'center' }}>
         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
           <span style={{ width: 18, height: 2, background: 'var(--moss)' }}/>
-          <span className="mono" style={{ fontSize: 10, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--stone)', fontWeight: 500 }}>word quality (0–100)</span>
+          <span className="mono" style={{ fontSize: 10, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--stone)', fontWeight: 500 }}>quality</span>
         </span>
         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-          <span style={{ width: 5, height: 14, background: 'var(--user-line)', borderRadius: 1 }}/>
-          <span className="mono" style={{ fontSize: 10, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--stone)', fontWeight: 500 }}>time spent</span>
+          <span style={{ width: 5, height: 12, background: 'var(--user-line)', borderRadius: 1 }}/>
+          <span className="mono" style={{ fontSize: 10, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--stone)', fontWeight: 500 }}>seconds (√-scaled)</span>
         </span>
         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-          <span style={{ width: 8, height: 8, borderRadius: '50%', background: 'var(--paper)', border: '1px solid var(--claude-line)' }}/>
-          <span className="mono" style={{ fontSize: 10, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--stone)', fontWeight: 500 }}>claude replies</span>
+          <span style={{ width: 14, height: 10, background: 'var(--moss-soft)', opacity: 0.6 }}/>
+          <span className="mono" style={{ fontSize: 10, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--stone)', fontWeight: 500 }}>goldilocks 70–89</span>
         </span>
       </div>
 
-      {/* Main chart */}
       <div style={{ position: 'relative' }}>
-        <svg viewBox={`0 0 ${W} ${H}`} width="100%" style={{ display: 'block', overflow: 'visible' }}>
+        <svg viewBox={`0 0 ${W} ${H}`} width="100%" style={{ display: 'block', overflow: 'visible' }}
+          role="img" aria-label="Quality of each word over the two minutes">
           {/* Quality gridlines */}
           {[0, 25, 50, 75, 100].map(q => (
             <g key={q}>
@@ -1052,26 +1316,19 @@ function Journey({ rounds, perWord, standout, weakest, seed }) {
               <text x={PAD_L - 6} y={qualityY(q) + 3} fontSize="10"
                 fill="var(--stone)" textAnchor="end"
                 fontFamily="Geist Mono, ui-monospace, monospace"
-                fontVariantNumeric="tabular-nums">
-                {q}
-              </text>
+                fontVariantNumeric="tabular-nums">{q}</text>
             </g>
           ))}
 
-          {/* Goldilocks band (60-80) */}
-          <rect x={PAD_L} y={qualityY(80)} width={plotW} height={qualityY(60) - qualityY(80)}
-            fill="var(--moss-soft)" opacity="0.1"/>
-          <text x={W - PAD_R - 4} y={qualityY(80) + 12} fontSize="9"
-            fill="var(--moss-deep)" textAnchor="end" fontStyle="italic"
-            fontFamily="Lora, Georgia, serif" opacity="0.7">
-            goldilocks zone
-          </text>
+          {/* Goldilocks band — 70-89, matching the rubric's STRONG band. */}
+          <rect x={PAD_L} y={qualityY(89)} width={plotW} height={qualityY(70) - qualityY(89)}
+            fill="var(--moss-soft)" opacity="0.18"/>
 
-          {/* Axis line */}
+          {/* Axis */}
           <line x1={PAD_L} y1={axisY} x2={W - PAD_R} y2={axisY}
             stroke="var(--line)" strokeWidth="1"/>
 
-          {/* Time-axis marks (0:00, 0:30, 1:00, 1:30, 2:00) */}
+          {/* Time axis marks */}
           {[0, 30, 60, 90, 120].map(s => {
             const x = xAt(s * 1000);
             return (
@@ -1090,30 +1347,26 @@ function Journey({ rounds, perWord, standout, weakest, seed }) {
             );
           })}
 
-          {/* Quality area fill */}
-          {areaD && <path d={areaD} fill="var(--moss-soft)" opacity="0.18"/>}
-
-          {/* Quality line */}
+          {/* Quality area + line */}
+          {areaD && <path d={areaD} fill="var(--moss-soft)" opacity="0.22"/>}
           {pathD && <path d={pathD} fill="none" stroke="var(--moss)" strokeWidth="1.6"
-            strokeLinejoin="round" strokeLinecap="round" opacity="0.75"/>}
+            strokeLinejoin="round" strokeLinecap="round" opacity="0.82"/>}
 
-          {/* Time bars (below axis) */}
+          {/* Time bars under axis (sqrt scaled) */}
           {userTurns.map((t, i) => {
             const x = xAt(t.atMs);
             const h = timeBarH(t.timeMs);
             const isLongest = longestPause && longestPause.idx === t.idx;
             return (
               <rect key={`tb-${i}`}
-                x={x - 2.2} y={axisY + 1} width="4.4" height={h}
+                x={x - 2.4} y={axisY + 1} width="4.8" height={h}
                 fill={isLongest ? 'var(--clay)' : 'var(--user-line)'}
-                opacity={isLongest ? 0.9 : 0.55}
+                opacity={isLongest ? 0.95 : 0.55}
                 rx="1.5"/>
             );
           })}
-
-          {/* Longest-pause time label */}
           {longestPause && (
-            <text x={xAt(longestPause.atMs)} y={axisY + timeBarH(longestPause.timeMs) + 12}
+            <text x={xAt(longestPause.atMs)} y={axisY + timeBarH(longestPause.timeMs) + 11}
               fontSize="10" fill="var(--clay)" textAnchor="middle"
               fontFamily="Geist Mono, ui-monospace, monospace"
               fontVariantNumeric="tabular-nums" fontWeight="500">
@@ -1121,51 +1374,63 @@ function Journey({ rounds, perWord, standout, weakest, seed }) {
             </text>
           )}
 
-          {/* Claude reply markers on axis */}
-          {claudeTurns.map((c, i) => (
-            <circle key={`c-${i}`} cx={xAt(c.atMs)} cy={axisY}
-              r="2.6" fill="var(--paper)" stroke="var(--claude-line)" strokeWidth="1.2"/>
-          ))}
+          {/* Claude reply labels above axis */}
+          {claudeWords.map((c, i) => {
+            const x = xAt(c.atMs);
+            return (
+              <g key={`cw-${i}`}>
+                <circle cx={x} cy={axisY} r="2.6"
+                  fill="var(--paper)" stroke="var(--claude-line)" strokeWidth="1.2"/>
+                <text x={x} y={axisY - 6} fontSize="10"
+                  fill="var(--claude-ink)" textAnchor="middle" fontStyle="italic"
+                  fontFamily="Lora, Georgia, serif" opacity="0.62">
+                  {c.word}
+                </text>
+              </g>
+            );
+          })}
 
-          {/* User word connectors + dots */}
+          {/* User word dots + connectors */}
           {userTurns.map((t, i) => {
             const x = xAt(t.atMs);
             const y = qualityY(t.quality);
             const isStandout = standout && standout === t.word;
             const isWeakest = weakest && weakest === t.word;
-            const isActive = hover === i;
-            const r = isActive ? 6.5 : (isStandout || isWeakest ? 5.2 : 4);
+            const isActive = activeIdx === i;
+            const r = isActive ? 7 : (isStandout || isWeakest ? 5.4 : 4);
             const color = qualityColor(t.quality);
             return (
               <g key={`u-${i}`}>
                 <line x1={x} y1={axisY} x2={x} y2={y}
-                  stroke={color} strokeWidth="1" opacity="0.22"/>
+                  stroke={color} strokeWidth="1" opacity={isActive ? 0.45 : 0.22}/>
                 <circle cx={x} cy={y} r={r}
-                  fill="var(--paper)" stroke={color} strokeWidth="1.6"/>
+                  fill="var(--paper)" stroke={color} strokeWidth="1.7"/>
                 <circle cx={x} cy={y} r={Math.max(1.5, r - 2)}
                   fill={color} opacity={isStandout ? 1 : 0.82}/>
-                <circle cx={x} cy={y} r="14"
+                {t.isRepeat && (
+                  <circle cx={x} cy={y} r={r + 3} fill="none"
+                    stroke="var(--clay)" strokeWidth="1" strokeDasharray="2 2" opacity="0.7"/>
+                )}
+                <circle cx={x} cy={y} r="16"
                   fill="transparent"
-                  onMouseEnter={() => setHover(i)}
-                  onMouseLeave={() => setHover(null)}
-                  style={{ cursor: 'pointer' }}/>
+                  onMouseEnter={() => setActiveIdx(i)}
+                  onMouseLeave={() => setActiveIdx(null)}
+                  onClick={() => setActiveIdx(activeIdx === i ? null : i)}
+                  onFocus={() => setActiveIdx(i)}
+                  onBlur={() => setActiveIdx(null)}
+                  tabIndex={0}
+                  role="button"
+                  aria-label={`Turn ${i+1}: ${t.word}, quality ${t.quality}, took ${(t.timeMs/1000).toFixed(1)} seconds`}
+                  style={{ cursor: 'pointer', outline: 'none' }}/>
               </g>
             );
           })}
-
-          {/* Standout leaf marker */}
-          {standout && peak && peak.word === standout && (
-            <g transform={`translate(${xAt(peak.atMs) - 6}, ${qualityY(peak.quality) - 20})`} opacity="0.85">
-              <path d="M6 11 C 6 7, 3 5, 2 2 C 5 2, 9 4, 10 7 C 10 9, 8 11, 6 11 Z"
-                fill="var(--moss-deep)"/>
-            </g>
-          )}
         </svg>
 
         {/* Hover tooltip */}
         {active && (() => {
           const xPct = (xAt(active.atMs) / W) * 100;
-          const isRight = xPct > 70;
+          const isRight = xPct > 68;
           return (
             <div style={{
               position: 'absolute',
@@ -1176,7 +1441,7 @@ function Journey({ rounds, perWord, standout, weakest, seed }) {
               border: '1px solid var(--line)',
               padding: '10px 13px',
               borderRadius: 3,
-              minWidth: 180,
+              minWidth: 200, maxWidth: 260,
               boxShadow: '0 8px 24px -12px rgba(42,39,32,0.3)',
               zIndex: 20,
               pointerEvents: 'none',
@@ -1185,7 +1450,7 @@ function Journey({ rounds, perWord, standout, weakest, seed }) {
                 fontSize: 9, color: 'var(--stone)', letterSpacing: '0.14em',
                 textTransform: 'uppercase', fontWeight: 500, marginBottom: 6,
               }}>
-                turn {active.idx + 1}
+                turn {active.idx + 1} · {wordBandLabel(active.quality)}
               </div>
               {active.prevAi && (
                 <div className="serif" style={{
@@ -1203,125 +1468,224 @@ function Journey({ rounds, perWord, standout, weakest, seed }) {
                 fontSize: 10, color: 'var(--stone)', letterSpacing: '0.08em',
                 fontVariantNumeric: 'tabular-nums',
                 display: 'flex', gap: 10, flexWrap: 'wrap',
+                marginBottom: active.reason ? 6 : 0,
               }}>
                 <span>{(active.timeMs/1000).toFixed(1)}s</span>
                 <span style={{ color: qualityColor(active.quality), fontWeight: 500 }}>q{active.quality}</span>
-                <span>@ {Math.floor(active.atMs/60000)}:{String(Math.floor((active.atMs%60000)/1000)).padStart(2,'0')}</span>
+                {active.isRepeat && <span style={{ color: 'var(--clay)' }}>repeat</span>}
               </div>
+              {active.reason && (
+                <div className="serif" style={{
+                  fontSize: 13, fontStyle: 'italic', color: 'var(--ink-soft)',
+                  lineHeight: 1.35,
+                }}>
+                  {active.reason}
+                </div>
+              )}
             </div>
           );
         })()}
-      </div>
-
-      {/* Summary cards */}
-      <div style={{
-        marginTop: 8, paddingTop: 16, borderTop: '1px solid var(--line-soft)',
-        display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 16,
-      }}>
-        {peak && (
-          <div>
-            <div className="mono" style={{ fontSize: 10, letterSpacing: '0.18em', textTransform: 'uppercase', color: 'var(--stone)', fontWeight: 500, marginBottom: 4 }}>
-              peak
-            </div>
-            <div className="serif" style={{ fontSize: 18, color: 'var(--moss-deep)', fontWeight: 400, display: 'flex', alignItems: 'baseline', gap: 8 }}>
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
-                <LeafIcon size={13} color="var(--moss-deep)"/> {peak.word}
-              </span>
-              <span className="mono" style={{ fontSize: 11, color: 'var(--stone)', fontVariantNumeric: 'tabular-nums' }}>q{peak.quality}</span>
-            </div>
-          </div>
-        )}
-        {valley && peak && valley.idx !== peak.idx && (
-          <div>
-            <div className="mono" style={{ fontSize: 10, letterSpacing: '0.18em', textTransform: 'uppercase', color: 'var(--stone)', fontWeight: 500, marginBottom: 4 }}>
-              most obvious
-            </div>
-            <div className="serif" style={{ fontSize: 18, color: 'var(--clay)', fontWeight: 400, display: 'flex', alignItems: 'baseline', gap: 8 }}>
-              {valley.word}
-              <span className="mono" style={{ fontSize: 11, color: 'var(--stone)', fontVariantNumeric: 'tabular-nums' }}>q{valley.quality}</span>
-            </div>
-          </div>
-        )}
-        {longestPause && (
-          <div>
-            <div className="mono" style={{ fontSize: 10, letterSpacing: '0.18em', textTransform: 'uppercase', color: 'var(--stone)', fontWeight: 500, marginBottom: 4 }}>
-              longest pause
-            </div>
-            <div className="serif" style={{ fontSize: 18, color: 'var(--ink)', fontWeight: 400 }}>
-              before <em style={{ color: 'var(--moss-deep)' }}>{longestPause.word}</em>
-              <span className="mono" style={{ fontSize: 12, color: 'var(--stone)', marginLeft: 6, fontVariantNumeric: 'tabular-nums' }}>
-                {(longestPause.timeMs/1000).toFixed(1)}s
-              </span>
-            </div>
-          </div>
-        )}
       </div>
     </div>
   );
 }
 
-function turnsHint(n) {
-  if (n === 0) return 'a quiet round';
-  if (n < 6) return 'deliberate pacing';
-  if (n < 14) return 'a steady rhythm';
-  if (n < 22) return 'a quick rhythm';
-  return 'a sprint';
+// Compact scatter showing time-vs-quality and the resulting insight.
+function TimeQualityScatter({ userTurns }) {
+  if (userTurns.length < 3) return null;
+  const xs = userTurns.map(t => t.timeMs/1000);
+  const ys = userTurns.map(t => t.quality);
+  const r = correlation(xs, ys);
+  const insight = timeQualityInsight(r);
+
+  const W = 520, H = 180;
+  const PAD_L = 32, PAD_R = 14, PAD_T = 10, PAD_B = 28;
+  const maxX = Math.max(6, ...xs);
+  const plotW = W - PAD_L - PAD_R;
+  const plotH = H - PAD_T - PAD_B;
+  const xAt = (s) => PAD_L + (plotW * s) / maxX;
+  const yAt = (q) => PAD_T + plotH * (1 - q/100);
+
+  // Least-squares trendline.
+  const n = xs.length;
+  const mx = xs.reduce((a,b)=>a+b,0)/n;
+  const my = ys.reduce((a,b)=>a+b,0)/n;
+  let num = 0, den = 0;
+  xs.forEach((x,i) => { num += (x-mx)*(ys[i]-my); den += (x-mx)*(x-mx); });
+  const slope = den ? num/den : 0;
+  const intercept = my - slope*mx;
+  const y0 = Math.max(0, Math.min(100, intercept));
+  const yM = Math.max(0, Math.min(100, slope*maxX + intercept));
+
+  return (
+    <div style={{
+      padding: 'clamp(20px, 2.4vw, 28px)',
+      background: 'rgba(255,252,241,0.5)',
+      border: '1px solid var(--line)',
+      borderRadius: 3,
+    }}>
+      <div className="mono" style={{
+        fontSize: 10, letterSpacing: '0.2em', textTransform: 'uppercase',
+        color: 'var(--stone)', fontWeight: 500, marginBottom: 14,
+      }}>
+        time vs. quality
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(260px, 1.2fr) minmax(220px, 1fr)', gap: 24, alignItems: 'center' }}>
+        <svg viewBox={`0 0 ${W} ${H}`} width="100%"
+          role="img" aria-label={`Scatter of quality vs seconds. Correlation ${r.toFixed(2)}`}>
+          <line x1={PAD_L} y1={H-PAD_B} x2={W-PAD_R} y2={H-PAD_B} stroke="var(--line)" strokeWidth="1"/>
+          <line x1={PAD_L} y1={PAD_T} x2={PAD_L} y2={H-PAD_B} stroke="var(--line)" strokeWidth="1"/>
+          {[0,50,100].map(q => (
+            <g key={q}>
+              <line x1={PAD_L-3} y1={yAt(q)} x2={PAD_L} y2={yAt(q)} stroke="var(--line)" strokeWidth="1"/>
+              <text x={PAD_L-6} y={yAt(q)+3} fontSize="9" textAnchor="end"
+                fill="var(--stone)" fontFamily="Geist Mono, ui-monospace, monospace"
+                fontVariantNumeric="tabular-nums">{q}</text>
+            </g>
+          ))}
+          {[0, Math.round(maxX/2), Math.round(maxX)].map(s => (
+            <g key={s}>
+              <line x1={xAt(s)} y1={H-PAD_B} x2={xAt(s)} y2={H-PAD_B+3} stroke="var(--line)" strokeWidth="1"/>
+              <text x={xAt(s)} y={H-PAD_B+14} fontSize="9" textAnchor="middle"
+                fill="var(--stone)" fontFamily="Geist Mono, ui-monospace, monospace"
+                fontVariantNumeric="tabular-nums">{s}s</text>
+            </g>
+          ))}
+          {Math.abs(r) >= 0.2 && (
+            <line x1={xAt(0)} y1={yAt(y0)} x2={xAt(maxX)} y2={yAt(yM)}
+              stroke="var(--moss-deep)" strokeWidth="1.3" opacity="0.55" strokeDasharray="3 3"/>
+          )}
+          {userTurns.map((t, i) => (
+            <circle key={i} cx={xAt(t.timeMs/1000)} cy={yAt(t.quality)} r="3.4"
+              fill={qualityColor(t.quality)} opacity="0.85"/>
+          ))}
+        </svg>
+        <div>
+          <div className="serif" style={{
+            fontSize: 16, lineHeight: 1.5, color: 'var(--ink)', fontStyle: 'italic',
+            marginBottom: 8,
+          }}>
+            {insight}
+          </div>
+          <div className="mono" style={{
+            fontSize: 10, color: 'var(--stone)', letterSpacing: '0.14em',
+            textTransform: 'uppercase',
+          }}>
+            correlation <span style={{ fontVariantNumeric: 'tabular-nums', marginLeft: 4 }}>r = {r.toFixed(2)}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 }
+
+// Chronological single-column cards. Shares activeIdx with the arc chart.
+function ExchangeCards({ userTurns, activeIdx, setActiveIdx, standout, weakest }) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      {userTurns.map((t, i) => {
+        const isStandout = standout && standout === t.word;
+        const isWeakest = weakest && weakest === t.word;
+        const isActive = activeIdx === i;
+        const bandColor = qualityColor(t.quality);
+        return (
+          <div key={i}
+            onMouseEnter={() => setActiveIdx(i)}
+            onMouseLeave={() => setActiveIdx(null)}
+            onClick={() => setActiveIdx(isActive ? null : i)}
+            style={{
+              padding: '14px 16px',
+              background: isActive ? 'var(--paper)' : 'rgba(255,252,241,0.5)',
+              border: `1px solid ${isActive ? bandColor : 'var(--line)'}`,
+              borderLeft: `3px solid ${bandColor}`,
+              borderRadius: 3,
+              display: 'grid',
+              gridTemplateColumns: 'auto minmax(0, 1fr) auto',
+              alignItems: 'center',
+              gap: 14,
+              cursor: 'pointer',
+              transition: 'border-color 200ms ease, background 200ms ease',
+            }}>
+            <span className="mono" style={{
+              fontSize: 10, color: 'var(--stone)', fontWeight: 500,
+              fontVariantNumeric: 'tabular-nums',
+            }}>
+              {String(i+1).padStart(2,'0')}
+            </span>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap' }}>
+                {t.prevAi && (
+                  <span className="serif" style={{
+                    fontSize: 15, color: 'var(--claude-ink)',
+                    fontStyle: 'italic', opacity: 0.85,
+                    display: 'inline-flex', alignItems: 'center', gap: 4,
+                  }}>
+                    <LeafIcon size={10} color="var(--claude-ink)"/> {t.prevAi}
+                  </span>
+                )}
+                {t.prevAi && <span style={{ color: 'var(--stone)', fontSize: 13 }}>→</span>}
+                <span className="serif" style={{
+                  fontSize: 19, color: 'var(--ink)', fontWeight: 400,
+                  letterSpacing: '-0.01em',
+                  display: 'inline-flex', alignItems: 'center', gap: 5,
+                }}>
+                  <SeedIcon size={10} color="var(--user-ink)"/> {t.word}
+                </span>
+                {isStandout && (
+                  <span className="mono" style={{
+                    fontSize: 9, color: 'var(--moss-deep)', letterSpacing: '0.18em',
+                    textTransform: 'uppercase',
+                  }}>standout</span>
+                )}
+                {isWeakest && !isStandout && (
+                  <span className="mono" style={{
+                    fontSize: 9, color: 'var(--clay)', letterSpacing: '0.18em',
+                    textTransform: 'uppercase',
+                  }}>weakest</span>
+                )}
+                {t.isRepeat && (
+                  <span className="mono" style={{
+                    fontSize: 9, color: 'var(--clay)', letterSpacing: '0.18em',
+                    textTransform: 'uppercase',
+                  }}>repeat</span>
+                )}
+              </div>
+              {t.reason && (
+                <div className="serif" style={{
+                  fontSize: 13, fontStyle: 'italic', color: 'var(--ink-soft)',
+                  marginTop: 4, lineHeight: 1.4,
+                }}>
+                  {t.reason}
+                </div>
+              )}
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 2 }}>
+              <span className="mono" style={{
+                fontSize: 12, color: bandColor, fontWeight: 500,
+                fontVariantNumeric: 'tabular-nums',
+              }}>
+                q{t.quality}
+              </span>
+              <span className="mono" style={{
+                fontSize: 10, color: 'var(--stone)',
+                fontVariantNumeric: 'tabular-nums',
+              }}>
+                {(t.timeMs/1000).toFixed(1)}s
+              </span>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function timeHint(s) {
   if (!s || isNaN(s)) return '';
   if (s < 2) return 'barely a breath between';
   if (s < 5) return 'one breath between';
   if (s < 9) return 'considered';
   return 'you took your time';
-}
-
-function MetricCard({ label, value, unit, revealed, hint, accent, loading }) {
-  return (
-    <div style={{
-      padding: 'clamp(20px, 2.4vw, 28px)',
-      background: 'var(--paper)',
-      opacity: revealed ? 1 : 0,
-      transform: revealed ? 'translateY(0)' : 'translateY(8px)',
-      transition: 'opacity 900ms ease, transform 900ms cubic-bezier(0.2,0.8,0.2,1)',
-      display: 'flex', flexDirection: 'column', gap: 10,
-      minHeight: 160,
-    }}>
-      <div className="mono" style={{
-        fontSize: 12, letterSpacing: '0.2em', textTransform: 'uppercase',
-        color: 'var(--ink-soft)', fontWeight: 500,
-      }}>
-        {label}
-      </div>
-      <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginTop: 'auto' }}>
-        <span className="serif" style={{
-          fontSize: 'clamp(52px, 6.5vw, 80px)',
-          fontWeight: 400,
-          letterSpacing: '-0.03em',
-          lineHeight: 1,
-          color: accent ? 'var(--moss-deep)' : 'var(--ink)',
-          fontVariantNumeric: 'tabular-nums',
-          animation: loading ? 'thinking 1.4s ease-in-out infinite' : 'none',
-        }}>
-          {value}
-        </span>
-        {unit && (
-          <span className="mono" style={{
-            fontSize: 12, letterSpacing: '0.12em', textTransform: 'uppercase',
-            color: 'var(--stone)', fontWeight: 500,
-          }}>
-            {unit}
-          </span>
-        )}
-      </div>
-      {hint && (
-        <div className="serif" style={{
-          fontSize: 15, fontStyle: 'italic', color: 'var(--stone)', fontWeight: 400,
-        }}>
-          {hint}
-        </div>
-      )}
-    </div>
-  );
 }
 
 // ---------- Tweaks ----------
