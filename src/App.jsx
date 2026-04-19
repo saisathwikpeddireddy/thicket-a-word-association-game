@@ -17,20 +17,70 @@ async function callClaude({ prompt, task }) {
   return data.text || '';
 }
 
+// Cheap heuristic: if the player's word is non-alphabetic garbage or shows up
+// earlier in the chain, we tell the AI to pivot instead of playing off it.
+function looksBrokenOrRepeat(userWord, history) {
+  if (!userWord) return true;
+  if (!/^[a-z][a-z'\-]*$/.test(userWord)) return true;
+  return history.some(h => h.word?.toLowerCase() === userWord.toLowerCase());
+}
+
 async function claudeNextWord(history, userWord) {
-  const recent = history.slice(-10).map(h => `${h.who === 'user' ? 'Player' : 'You'}: ${h.word}`).join('\n');
-  const prompt = `You are playing a two-minute word-association improv game with a human. You alternate single words. The human just said: "${userWord}".
+  // Full chain, not just the last 10 — required so the repeat guard works.
+  const chainLines = history.map(h => `${h.who === 'user' ? 'Player' : 'You'}: ${h.word}`).join('\n');
+  const usedWords = Array.from(new Set(history.map(h => h.word).concat([userWord]))).filter(Boolean);
+  const brokenReply = looksBrokenOrRepeat(userWord, history);
 
-Recent exchange:
-${recent || '(none yet)'}
+  const prompt = `You are Claude, playing Thicket — a two-minute word-association game with a human. You alternate single words, each one sparking from the last.
 
-Respond with EXACTLY ONE single lowercase word (1-2 syllables preferred, no punctuation, no quotes, no explanation) that feels like a natural, playful association from "${userWord}". Aim for the Goldilocks zone — not the most obvious rhyme/synonym, not something try-hard. Surprising but inevitable. Never repeat a word already in the exchange.
+GOAL
+Pick a word that lands in the Goldilocks zone: unexpected but clearly connected. Obvious in hindsight, not on first impulse. A listener should nod ("oh, right"), not squint ("what?"). Try to give the human ROOM — a word with only one sensible reply traps them.
+
+THE HUMAN JUST SAID: "${userWord}"
+
+Full chain so far (${history.length ? 'oldest first' : 'empty'}):
+${chainLines || '(none yet)'}
+
+Never reuse any word from this list:
+${usedWords.length ? usedWords.join(', ') : '(none)'}
+
+GOOD MOVES (each would score ~75–85 on the scorer's rubric)
+  market   → stall      (shifts angle inside the same scene)
+  hour     → second     (pun on "second" as time/rank)
+  trumpet  → brass      (material, not category "instrument")
+  spanner  → twist      (idiom pivot)
+  chaos    → carnival   (shared feeling, different domain)
+  rush     → hour       (compound-word lock-in)
+
+AVOID (these score below 55)
+  first-impulse synonyms or rhymes  (loud → noisy, bright → light)
+  same-category siblings            (apple → banana, red → blue)
+  nature-filler reflexes            (moss, dusk, hollow, ember, lantern, thread, whisper, drift) — unless the chain genuinely invites them
+  anything a dictionary would list as the top association
+
+REGISTER VARIETY
+Don't stay in one mood. If the last few turns were concrete, go abstract. If earnest, go wry. If everyday, go specialized. Mix domains across the round (kitchen, sport, music, finance, weather, body, machines) so the chain doesn't settle into one vibe.
+
+${brokenReply
+  ? `PIVOT: the human's word doesn't give you much. Don't double down on it — pick a fresh word that opens a new direction for the chain.`
+  : `Respond off "${userWord}" — the word immediately before yours is the one you're riffing on.`}
+
+VOICE
+Curious, unflashy, playful. No show-off vocabulary. No proper nouns unless the chain has already gone there.
+
+OUTPUT
+Exactly one single lowercase word. 1–3 syllables. No punctuation, no quotes, no explanation.
 
 Your word:`;
+
   try {
     const text = await callClaude({ prompt, task: 'word' });
     const cleaned = (text || '').trim().toLowerCase().replace(/[^a-z'\-]/g, '').slice(0, 24);
-    return cleaned || fallbackWord(userWord, history);
+    // Safety net: if Claude echoed a used word anyway, fall back.
+    if (!cleaned || usedWords.map(w=>w.toLowerCase()).includes(cleaned)) {
+      return fallbackWord(userWord, history);
+    }
+    return cleaned;
   } catch (e) { return fallbackWord(userWord, history); }
 }
 
@@ -54,18 +104,29 @@ function detectRepeats(rounds, seedWord) {
   return flags;
 }
 
+// Deterministic quality aggregation — identical perWord always yields identical
+// quality. Weak words drag more than strong words lift (below 50 is amplified),
+// with a small bonus for hitting a real leap.
+function aggregateQuality(perWord) {
+  if (!perWord.length) return 0;
+  const adjusted = perWord.map(q => q >= 50 ? q : 50 - (50 - q) * 1.6);
+  const mean = adjusted.reduce((a,b) => a+b, 0) / adjusted.length;
+  const peak = Math.max(...perWord);
+  const peakBonus = peak >= 90 ? 3 : peak >= 80 ? 2 : peak >= 70 ? 1 : 0;
+  return Math.max(0, Math.min(100, Math.round(mean + peakBonus)));
+}
+
 async function claudeScoreGame(rounds, avgResponseMs, seedWord) {
   const userWords = rounds.map(r => r.user).filter(Boolean);
   const repeatFlags = detectRepeats(rounds, seedWord);
 
-  // Build the transcript with unambiguous speaker labels so the LLM
-  // never mixes up who said what.
+  // Unambiguous turn-indexed transcript. Turn numbers match the output indices.
   const lines = [];
   let prevAi = seedWord || null;
   lines.push(`(game opens with AI word: ${seedWord ? `"${seedWord}"` : '(none)'})`);
   rounds.forEach((r, i) => {
     const t = ((r.userMs||0)/1000).toFixed(1);
-    const repeatMark = repeatFlags[i] ? ' [REPEAT of an earlier word in this chain — hard cap 25]' : '';
+    const repeatMark = repeatFlags[i] ? ' [REPEAT — cap 25]' : '';
     lines.push(`Turn ${i+1}: AI="${prevAi || '?'}" → PLAYER="${r.user}" (${t}s)${repeatMark}`);
     if (r.claude) {
       lines.push(`         → AI reply="${r.claude}"`);
@@ -74,56 +135,102 @@ async function claudeScoreGame(rounds, avgResponseMs, seedWord) {
   });
   const transcript = lines.join('\n');
 
-  const prompt = `You are the Goldilocks judge for a word-association improv game. You score how well the PLAYER responded to each AI word. The sweet spot is "surprising but inevitable" — not the most obvious link, not a try-hard curiosity.
+  const n = userWords.length;
+  const prompt = `You are the judge for Thicket, a word-association game. You score each PLAYER word on how well it responded to the AI word immediately before it.
 
-IMPORTANT — WHO SAID WHAT:
-- "AI=..." is a word the AI said.
-- "PLAYER=..." is the word the human player said in response.
-- You are ONLY scoring PLAYER words. Never attribute an AI word to the player.
+WHO SAID WHAT
+"AI=..." is a word the AI said — these are SETUPS, not judged.
+"PLAYER=..." is what the human said in response — these are what you score.
 
-Transcript:
+Transcript (turn-indexed; use these turn numbers in your output):
 ${transcript}
 
-Player stats: ${rounds.length} turns, avg response ${(avgResponseMs/1000).toFixed(1)}s
+—— RUBRIC ————————————————————————————————————————
 
-RUBRIC — for each PLAYER word, score how it responded to the AI word immediately before it:
-  90-100  BRILLIANT  Sideways leap that reframes the chain. Plays on a second sense (pun/compound/idiom), or jumps register (abstract↔concrete) while staying coherent. Rare. Examples: music→cigar, hour→second (as in "second wind"), wish→cancer (emotional pivot), chaos→carnival.
-  75-89   STRONG     Unexpected but clearly connected. Obvious in hindsight, not on first impulse. Examples: rush→hour, potato→chip, spanner→twist.
-  60-74   SOLID      A real association with creative reach. Not trite, not try-hard. Examples: cigar→smoke, disheveled→messy.
-  45-59   PREDICTABLE  First, most common link: category, synonym, rhyme, cliché pairing. Examples: light→shadow, sun→warm, loud→music, cold→shiver, fast→blur.
-  25-44   WEAK       Rote reflex, stale cliché. Examples: sheep→wool (mechanical), trumpet→music (category).
-  0-24    BROKEN     Unrelated, nonsense, or REPEATED from earlier in the chain.
+For each PLAYER word, ask: how would a thoughtful, non-expert listener react?
 
-HARD CAPS:
-- Word already used earlier in the chain (marked [REPEAT]): hard cap 25.
-- The single most-common one-word association: cap 50.
-- Obscure show-off a normal listener wouldn't accept: cap 55.
+90–100  BRILLIANT    Reframes the chain. Pun on a second sense; register jump (concrete↔abstract) that still connects; idiom pivot. Rare — maybe 1 per round.
+                     hour → second     (second as "second wind")
+                     rush → hour       (compound-word lock-in)
+                     chaos → carnival  (same feeling, different domain)
 
-CONTEXT ADJUSTMENTS (after base):
-- Took >5s and delivered rote/obvious: −10 (they had time to find better).
-- Took <2s and delivered 75+: +5 (instinct reward).
-- Word that visibly sets up a rich next exchange: +5.
+75–89   STRONG       Unexpected but clearly connected. Obvious in hindsight, not on first impulse.
+                     potato → chip     (compound, not category)
+                     spanner → twist   (idiom)
+                     trumpet → brass   (material, not category "instrument")
 
-DISTRIBUTION REQUIREMENT — be willing to use the full range. If you find yourself clustering scores in the 55–65 band, you are under-scoring. Look at each word hard: is it the FIRST response anyone would give to the AI word? Then it is 45–55, not 65. Is it a true creative leap? Then score 80+. Never return more than half the words within a 10-point band.
+60–74   SOLID        A real association with a little reach. Not the first word most people would say, but adjacent to it.
+                     cigar → smoke
+                     river → stone
 
-OVERALL — "quality" is weighted so weak words drag more than strong words lift. A single cliché hurts the arc more than a single gem saves it.
+45–59   PREDICTABLE  The first link most listeners would name: synonym, rhyme, top-of-list category.
+                     light → shadow
+                     sun → warm
+                     loud → music
 
-REASONS — for each word, write a tight phrase (max 8 words) saying WHY it got that score. Speak directly to the player: "first synonym that comes to mind", "brave emotional leap", "rhyme reflex", "fresh compound play", "solid but common".
+25–44   WEAK         Rote reflex or stale pairing with no angle.
+                     sheep → wool
+                     trumpet → music
 
-ALTERNATIVE — for the weakest word (if any), suggest ONE alternative single word that would have scored 75+ from the same AI prompt. Just the word.
+0–24    BROKEN       Unrelated, nonsense, non-word input, or REPEATED from earlier.
 
-COACHING NOTE — exactly 2 sentences, warm, specific. The FIRST names one real strength (quote two of the player's words exactly). The SECOND names one pattern to try next round, concrete. No exclamation marks. No generic advice ("trust yourself"). Quote words using these exact tokens: ${userWords.slice(0,8).map(w=>`"${w}"`).join(', ')}.
+—— BONUSES (apply to base score BEFORE caps) ————————————
 
-Return ONLY valid JSON, no code fences, no prose outside the object:
++5  Took <2s and base is 75+ (instinct reward).
++3  Word visibly sets up a richer next AI turn.
+
+Do NOT penalize slow replies. A pause often means the player was working to avoid the obvious — don't punish that.
+
+—— CAPS (apply AFTER bonuses) —————————————————————————
+
+Marked [REPEAT]:                       cap 25.
+Non-word / typo / emoji / multi-word:  cap 20.
+Link requires the player to explain it
+for a listener to accept:              cap 60.
+
+—— DIFFICULTY OF THE AI SETUP ——————————————————————————
+
+If the AI's preceding word is itself narrow (only 2–3 reasonable replies exist), do not score a predictable player reply below 55 — they took the only road available. Note this in the reason: "AI's setup left little room."
+
+—— SCORE WHAT'S THERE ——————————————————————————————————
+
+Score each word in isolation, using ONLY the AI word immediately before it. Do not compound-punish a run of mediocre replies. Do not fabricate variance: if the round was genuinely steady, a flat curve of 60s is the correct answer. If one word is a true leap, score it 85+ even if the rest are 55s.
+
+—— REASONS ————————————————————————————————————————————
+
+For each PLAYER word, write a reason up to 12 words, second person, naming WHAT the player did. Useful reasons:
+  "first synonym that comes to mind — safe move"
+  "pun on 'second' as time — real leap"
+  "AI's setup was narrow; reasonable pick"
+  "category jump with no connective tissue — lands flat"
+  "couldn't parse as a word"
+
+Avoid generic ("nice", "okay", "bold"). Name the move.
+
+—— STANDOUT / WEAKEST USE TURN NUMBERS ——————————————————
+
+standoutTurn: 1-based turn number of the single best PLAYER reply.
+weakestTurn:  1-based turn number of the weakest. 0 if every word scored 65+.
+weakestAlt:   one single word that would have scored 75+ from the same AI prompt, or empty.
+
+—— COACHING NOTE ———————————————————————————————————————
+
+1–2 sentences, warm and specific.
+  First sentence: name ONE concrete thing the player did well, referring to what happened at a specific turn (e.g., "On turn 4 you jumped from 'rush' to 'hour' — exactly the compound-word pivot the game rewards.").
+  Second sentence (optional): ONE pattern to try next round, concrete and actionable (e.g., "When an AI word has two meanings, try the less-obvious one first.").
+No exclamation marks. No generic "trust yourself" advice.
+
+—— OUTPUT ——————————————————————————————————————————————
+
+Return ONLY valid JSON — no code fences, no prose outside the object:
 {
-  "quality": <int 0-100>,
-  "perWord": [<int 0-100, exactly ${userWords.length} numbers, in order>],
-  "reasons": [<string, exactly ${userWords.length} short phrases, in order, each ≤8 words>],
-  "standout": "<single best PLAYER word from their list>",
-  "standoutWhy": "<one short phrase explaining why it was the best leap>",
-  "weakest": "<single weakest PLAYER word, or empty string if every word scored 65+>",
-  "weakestAlt": "<one alternative single word that would have scored 75+ from that AI prompt, or empty>",
-  "note": "<exactly 2 sentences following the COACHING NOTE rules above>"
+  "perWord": [<int 0-100, exactly ${n} numbers, in order>],
+  "reasons": [<string, exactly ${n} phrases, in order, ≤12 words each>],
+  "standoutTurn": <int 1-${n}>,
+  "standoutWhy": "<one short phrase, ≤10 words>",
+  "weakestTurn": <int 0-${n}>,
+  "weakestAlt": "<one word, or empty>",
+  "note": "<1–2 sentences following the COACHING NOTE rules>"
 }`;
 
   try {
@@ -131,23 +238,41 @@ Return ONLY valid JSON, no code fences, no prose outside the object:
     const match = text.match(/\{[\s\S]*\}/);
     if (match) {
       const parsed = JSON.parse(match[0]);
-      let perWord = Array.isArray(parsed.perWord) ? parsed.perWord.map(n => Math.max(0, Math.min(100, parseInt(n)||50))) : [];
-      while (perWord.length < userWords.length) perWord.push(parsed.quality || 55);
-      perWord = perWord.slice(0, userWords.length);
-      // Apply client-side repeat caps as a safety net.
+
+      let perWord = Array.isArray(parsed.perWord)
+        ? parsed.perWord.map(v => Math.max(0, Math.min(100, parseInt(v) || 50)))
+        : [];
+      while (perWord.length < n) perWord.push(50);
+      perWord = perWord.slice(0, n);
+      // Repeat cap is the law — enforce client-side too.
       perWord = perWord.map((q, i) => repeatFlags[i] ? Math.min(q, 25) : q);
 
-      let reasons = Array.isArray(parsed.reasons) ? parsed.reasons.map(r => String(r || '').trim()) : [];
-      while (reasons.length < userWords.length) reasons.push('');
-      reasons = reasons.slice(0, userWords.length);
+      let reasons = Array.isArray(parsed.reasons)
+        ? parsed.reasons.map(r => String(r || '').trim())
+        : [];
+      while (reasons.length < n) reasons.push('');
+      reasons = reasons.slice(0, n);
+
+      const clampTurn = (v) => {
+        const i = parseInt(v);
+        if (!Number.isFinite(i)) return 0;
+        return Math.max(0, Math.min(n, i));
+      };
+      const standoutTurn = clampTurn(parsed.standoutTurn);
+      const weakestTurn  = clampTurn(parsed.weakestTurn);
+
+      const standoutIdx = standoutTurn > 0 ? standoutTurn - 1 : perWord.indexOf(Math.max(...perWord));
+      const weakestIdx  = weakestTurn  > 0 ? weakestTurn  - 1 : -1;
 
       return {
-        quality: Math.max(0, Math.min(100, parseInt(parsed.quality) || 50)),
+        quality: aggregateQuality(perWord), // deterministic
         perWord,
         reasons,
-        standout: String(parsed.standout || '').toLowerCase().trim(),
+        standoutIdx,
+        standout: userWords[standoutIdx] || '',
         standoutWhy: String(parsed.standoutWhy || '').trim(),
-        weakest: String(parsed.weakest || '').toLowerCase().trim(),
+        weakestIdx,
+        weakest: weakestIdx >= 0 ? (userWords[weakestIdx] || '') : '',
         weakestAlt: String(parsed.weakestAlt || '').toLowerCase().trim(),
         note: String(parsed.note || '').trim(),
         repeatFlags,
@@ -155,30 +280,33 @@ Return ONLY valid JSON, no code fences, no prose outside the object:
     }
   } catch(e) {}
 
-  // Local fallback — maps response time to a band (less clustered than before).
+  // Local fallback if the API or parse failed. Maps response time to a band
+  // with minimal fabricated variance (±6 instead of ±14).
   const perWord = rounds.map((r, i) => {
     if (repeatFlags[i]) return 22;
     const s = (r.userMs || 3000) / 1000;
     let base;
-    if (s < 1.2) base = 50;
+    if (s < 1.2) base = 52;
     else if (s < 2.5) base = 62;
-    else if (s < 5) base = 65;
-    else if (s < 9) base = 58;
-    else base = 52;
-    return base + Math.round((Math.random() - 0.5) * 14);
+    else if (s < 5) base = 64;
+    else if (s < 9) base = 60;
+    else base = 56;
+    return base + Math.round((Math.random() - 0.5) * 6);
   }).map(n => Math.max(0, Math.min(100, n)));
 
   const maxIdx = perWord.indexOf(Math.max(...perWord));
   const minIdx = perWord.indexOf(Math.min(...perWord));
   return {
-    quality: Math.round(perWord.reduce((a,b)=>a+b,0) / (perWord.length || 1)),
+    quality: aggregateQuality(perWord),
     perWord,
     reasons: perWord.map(q => q >= 70 ? 'felt earned' : q >= 55 ? 'solid link' : 'first-impulse pick'),
+    standoutIdx: maxIdx,
     standout: userWords[maxIdx] || '',
     standoutWhy: 'the one that turned a corner',
+    weakestIdx: perWord[minIdx] < 55 ? minIdx : -1,
     weakest: perWord[minIdx] < 55 ? (userWords[minIdx] || '') : '',
     weakestAlt: '',
-    note: `You kept the chain honest through ${userWords[0] || 'the opening'} and ${userWords[Math.min(2, userWords.length-1)] || 'the middle'}. Next round, when an AI word has two meanings, try the less-obvious one first.`,
+    note: `On turn ${maxIdx+1} you landed "${userWords[maxIdx] || 'a good one'}" — that's the kind of reach the game rewards. Next round, when an AI word has two meanings, try the less-obvious sense first.`,
     repeatFlags,
   };
 }
@@ -384,7 +512,14 @@ function PlayScreen({ onEnd }) {
 
   useEffect(() => {
     (async () => {
-      const openers = ['rain','window','ember','pocket','river','threshold','clover','lantern'];
+      // Opener pool spans domains — kitchen, body, office, weather, sport,
+      // music, travel, home — so rounds don't settle into one vibe.
+      const openers = [
+        'window','pocket','ladder','mirror','button','ticket','pillow','kettle',
+        'rope','paper','bridge','signal','engine','bottle','map','coin',
+        'shoulder','handle','needle','glove','whistle','drawer','salt','fog',
+        'market','ribbon','hinge','timer',
+      ];
       const opener = openers[Math.floor(Math.random()*openers.length)];
       await new Promise(r => setTimeout(r, 650));
       setSeed(opener);
@@ -822,6 +957,8 @@ function EndScreen({ rounds, avgResponseMs, seed, onRestart }) {
     reasons: scoreData?.reasons || [],
     seed,
     repeatFlags: scoreData?.repeatFlags || [],
+    standoutIdx: typeof scoreData?.standoutIdx === 'number' ? scoreData.standoutIdx : -1,
+    weakestIdx:  typeof scoreData?.weakestIdx  === 'number' ? scoreData.weakestIdx  : -1,
   }), [rounds, scoreData, seed]);
 
   const longestPause = userTurns.reduce((b, t) => !b || t.timeMs > b.timeMs ? t : b, null);
@@ -923,11 +1060,10 @@ function EndScreen({ rounds, avgResponseMs, seed, onRestart }) {
         </div>
 
         {/* Standout callout */}
-        {!scoring && scoreData?.standout && (
+        {!scoring && userTurns.some(t => t.isStandout) && (
           <div style={{ marginBottom: 32 }}>
             <StandoutCallout
-              standout={scoreData.standout}
-              standoutWhy={scoreData.standoutWhy}
+              standoutWhy={scoreData?.standoutWhy}
               userTurns={userTurns}
             />
           </div>
@@ -1008,8 +1144,6 @@ function EndScreen({ rounds, avgResponseMs, seed, onRestart }) {
               seed={seed}
               activeIdx={activeIdx}
               setActiveIdx={setActiveIdx}
-              standout={scoreData?.standout}
-              weakest={scoreData?.weakest}
               longestPause={longestPause}
             />
           </div>
@@ -1035,8 +1169,6 @@ function EndScreen({ rounds, avgResponseMs, seed, onRestart }) {
               userTurns={userTurns}
               activeIdx={activeIdx}
               setActiveIdx={setActiveIdx}
-              standout={scoreData?.standout}
-              weakest={scoreData?.weakest}
             />
             {scoreData?.weakest && scoreData?.weakestAlt && (
               <div className="serif" style={{
@@ -1165,7 +1297,7 @@ function buildShareText({ rounds, seed, scoreData, avgResponseMs }) {
 
 // Build a unified per-user-turn array with everything downstream
 // components need. userTurns[0].prevAi is the seed (the AI's opener).
-function buildUserTurns({ rounds, perWord, reasons, seed, repeatFlags }) {
+function buildUserTurns({ rounds, perWord, reasons, seed, repeatFlags, standoutIdx, weakestIdx }) {
   const out = [];
   let prevAi = seed || null;
   rounds.forEach((r) => {
@@ -1182,6 +1314,8 @@ function buildUserTurns({ rounds, perWord, reasons, seed, repeatFlags }) {
       atMs: typeof r.userAt === 'number' ? r.userAt : 0,
       claudeAt: typeof r.claudeAt === 'number' ? r.claudeAt : null,
       isRepeat: !!repeatFlags?.[idx],
+      isStandout: idx === standoutIdx,
+      isWeakest: idx === weakestIdx,
     });
     if (r.claude) prevAi = r.claude;
   });
@@ -1189,8 +1323,8 @@ function buildUserTurns({ rounds, perWord, reasons, seed, repeatFlags }) {
 }
 
 // Featured moment — the standout leap, shown prominently above the chart.
-function StandoutCallout({ standout, standoutWhy, userTurns }) {
-  const match = userTurns.find(t => t.word === standout);
+function StandoutCallout({ standoutWhy, userTurns }) {
+  const match = userTurns.find(t => t.isStandout);
   if (!match) return null;
   return (
     <div style={{
@@ -1240,7 +1374,7 @@ function StandoutCallout({ standout, standoutWhy, userTurns }) {
 }
 
 // The arc — quality over time, with linked hover/focus state.
-function ArcChart({ userTurns, seed, activeIdx, setActiveIdx, standout, weakest, longestPause }) {
+function ArcChart({ userTurns, seed, activeIdx, setActiveIdx, longestPause }) {
   const totalMs = GAME_SECONDS * 1000;
   const maxTimeMs = Math.max(3000, ...userTurns.map(t => t.timeMs));
 
@@ -1394,8 +1528,8 @@ function ArcChart({ userTurns, seed, activeIdx, setActiveIdx, standout, weakest,
           {userTurns.map((t, i) => {
             const x = xAt(t.atMs);
             const y = qualityY(t.quality);
-            const isStandout = standout && standout === t.word;
-            const isWeakest = weakest && weakest === t.word;
+            const isStandout = t.isStandout;
+            const isWeakest = t.isWeakest;
             const isActive = activeIdx === i;
             const r = isActive ? 7 : (isStandout || isWeakest ? 5.4 : 4);
             const color = qualityColor(t.quality);
@@ -1580,12 +1714,12 @@ function TimeQualityScatter({ userTurns }) {
 }
 
 // Chronological single-column cards. Shares activeIdx with the arc chart.
-function ExchangeCards({ userTurns, activeIdx, setActiveIdx, standout, weakest }) {
+function ExchangeCards({ userTurns, activeIdx, setActiveIdx }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
       {userTurns.map((t, i) => {
-        const isStandout = standout && standout === t.word;
-        const isWeakest = weakest && weakest === t.word;
+        const isStandout = t.isStandout;
+        const isWeakest = t.isWeakest;
         const isActive = activeIdx === i;
         const bandColor = qualityColor(t.quality);
         return (
