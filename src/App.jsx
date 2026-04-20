@@ -207,6 +207,8 @@ For each PLAYER word, write a reason up to 12 words, second person, naming WHAT 
 
 Avoid generic ("nice", "okay", "bold"). Name the move.
 
+CRITICAL: your reason's tone must match the score's rubric band. A 75+ cannot be described as "predictable" or "safe". A sub-55 cannot be called a "real leap" or "earned". If the reason and score disagree, you have made an error — fix the score or the reason before returning.
+
 —— STANDOUT / WEAKEST USE TURN NUMBERS ——————————————————
 
 standoutTurn: 1-based turn number of the single best PLAYER reply.
@@ -222,10 +224,16 @@ No exclamation marks. No generic "trust yourself" advice.
 
 —— OUTPUT ——————————————————————————————————————————————
 
-Return ONLY valid JSON — no code fences, no prose outside the object:
+Return ONLY valid JSON — no code fences, no prose outside the object.
+
+Each entry in "turns" MUST include its 1-based turn number so nothing can shift. Provide exactly ${n} entries, one per PLAYER word, numbered 1 through ${n}:
+
 {
-  "perWord": [<int 0-100, exactly ${n} numbers, in order>],
-  "reasons": [<string, exactly ${n} phrases, in order, ≤12 words each>],
+  "turns": [
+    { "turn": 1, "score": <int 0-100>, "reason": "<≤12 words, matches score band>" },
+    { "turn": 2, "score": <int 0-100>, "reason": "<…>" }
+    // … through turn ${n}
+  ],
   "standoutTurn": <int 1-${n}>,
   "standoutWhy": "<one short phrase, ≤10 words>",
   "weakestTurn": <int 0-${n}>,
@@ -239,19 +247,29 @@ Return ONLY valid JSON — no code fences, no prose outside the object:
     if (match) {
       const parsed = JSON.parse(match[0]);
 
-      let perWord = Array.isArray(parsed.perWord)
-        ? parsed.perWord.map(v => Math.max(0, Math.min(100, parseInt(v) || 50)))
-        : [];
-      while (perWord.length < n) perWord.push(50);
-      perWord = perWord.slice(0, n);
-      // Repeat cap is the law — enforce client-side too.
-      perWord = perWord.map((q, i) => repeatFlags[i] ? Math.min(q, 25) : q);
+      // Turn-keyed lookup prevents the score/reason shift bug. Each entry
+      // carries its own 1-based turn number, so a missing or out-of-order
+      // entry cannot drag the rest of the array with it.
+      const byTurn = new Map();
+      if (Array.isArray(parsed.turns)) {
+        parsed.turns.forEach(e => {
+          const t = parseInt(e?.turn);
+          if (Number.isFinite(t) && t >= 1 && t <= n) {
+            byTurn.set(t, e);
+          }
+        });
+      }
 
-      let reasons = Array.isArray(parsed.reasons)
-        ? parsed.reasons.map(r => String(r || '').trim())
-        : [];
-      while (reasons.length < n) reasons.push('');
-      reasons = reasons.slice(0, n);
+      const perWord = [];
+      const reasons = [];
+      for (let i = 0; i < n; i++) {
+        const e = byTurn.get(i + 1);
+        const raw = e ? parseInt(e.score) : NaN;
+        let q = Number.isFinite(raw) ? Math.max(0, Math.min(100, raw)) : 50;
+        if (repeatFlags[i]) q = Math.min(q, 25); // Repeat cap is the law.
+        perWord.push(q);
+        reasons.push(e ? String(e.reason || '').trim() : '');
+      }
 
       const clampTurn = (v) => {
         const i = parseInt(v);
@@ -548,7 +566,7 @@ function PlayScreen({ onEnd }) {
   }, [started, rounds, onEnd]);
 
   const submit = useCallback(async () => {
-    const word = input.trim().toLowerCase().replace(/[^a-z'\-]/g, '').slice(0, 24);
+    const word = input.trim().toLowerCase().split(/\s+/)[0].replace(/[^a-z'\-]/g, '').slice(0, 24);
     if (!word || waitingClaude || endedRef.current) return;
 
     const userMs = Date.now() - turnStartRef.current;
@@ -1149,13 +1167,6 @@ function EndScreen({ rounds, avgResponseMs, seed, onRestart }) {
           </div>
         )}
 
-        {/* Time vs. quality */}
-        {!scoring && userTurns.length >= 3 && (
-          <div style={{ marginBottom: 40 }}>
-            <TimeQualityScatter userTurns={userTurns} />
-          </div>
-        )}
-
         {/* Exchange cards */}
         {!scoring && userTurns.length > 0 && (
           <div style={{ marginBottom: 24 }}>
@@ -1169,16 +1180,8 @@ function EndScreen({ rounds, avgResponseMs, seed, onRestart }) {
               userTurns={userTurns}
               activeIdx={activeIdx}
               setActiveIdx={setActiveIdx}
+              weakestAlt={scoreData?.weakestAlt || ''}
             />
-            {scoreData?.weakest && scoreData?.weakestAlt && (
-              <div className="serif" style={{
-                marginTop: 14, fontSize: 14, fontStyle: 'italic',
-                color: 'var(--stone)', paddingLeft: 12,
-                borderLeft: '2px solid var(--line)',
-              }}>
-                instead of <strong style={{ color: 'var(--clay)' }}>{scoreData.weakest}</strong>, you could have tried <strong style={{ color: 'var(--moss-deep)' }}>{scoreData.weakestAlt}</strong>.
-              </div>
-            )}
           </div>
         )}
       </div>
@@ -1196,11 +1199,11 @@ function qualityColor(q) {
 // Maps a score to its rubric band label. Keeps copy honest — a 58
 // is not "the goldilocks zone", it's just below it.
 function scoreBand(q) {
-  if (q >= 85) return { label: 'brilliant', headline: 'You found the clearing.', tone: 'var(--moss-deep)' };
-  if (q >= 70) return { label: 'strong',    headline: 'You hit the Goldilocks zone.', tone: 'var(--moss-deep)' };
-  if (q >= 55) return { label: 'solid',     headline: 'You kept it solid.', tone: 'var(--moss)' };
-  if (q >= 40) return { label: 'first-path',headline: 'You took the first path most times.', tone: 'var(--stone)' };
-  return { label: 'rough', headline: 'A shaky round — plenty to climb next time.', tone: 'var(--clay)' };
+  if (q >= 85) return { label: 'brilliant', headline: 'You found the clearing', tone: 'var(--moss-deep)' };
+  if (q >= 70) return { label: 'strong',    headline: 'You hit the Goldilocks zone', tone: 'var(--moss-deep)' };
+  if (q >= 55) return { label: 'solid',     headline: 'You kept it solid', tone: 'var(--moss)' };
+  if (q >= 40) return { label: 'first-path',headline: 'You took the first path most times', tone: 'var(--stone)' };
+  return { label: 'rough', headline: 'A shaky round — plenty to climb next time', tone: 'var(--clay)' };
 }
 
 // Label for a single score reflecting the rubric bands (not just a comparison).
@@ -1232,31 +1235,6 @@ function saveHistoryEntry(entry) {
     window.localStorage.setItem(HISTORY_KEY, JSON.stringify(trimmed));
     return trimmed;
   } catch { return []; }
-}
-
-// Pearson correlation between two arrays (same length).
-function correlation(xs, ys) {
-  const n = Math.min(xs.length, ys.length);
-  if (n < 3) return 0;
-  let mx = 0, my = 0;
-  for (let i = 0; i < n; i++) { mx += xs[i]; my += ys[i]; }
-  mx /= n; my /= n;
-  let num = 0, dx = 0, dy = 0;
-  for (let i = 0; i < n; i++) {
-    const ax = xs[i] - mx, ay = ys[i] - my;
-    num += ax * ay; dx += ax * ax; dy += ay * ay;
-  }
-  const denom = Math.sqrt(dx * dy);
-  return denom ? num / denom : 0;
-}
-
-// Turn the correlation between time-taken and quality into a human sentence.
-function timeQualityInsight(r) {
-  if (Math.abs(r) < 0.2) return 'Taking longer didn\'t change much — instinct was about as good as deliberation.';
-  if (r > 0.5)  return 'The extra seconds clearly paid off — your slower words scored noticeably higher.';
-  if (r > 0.2)  return 'Slower answers scored a little better — deliberation helped, modestly.';
-  if (r < -0.5) return 'Your quickest answers were your strongest — overthinking seemed to hurt.';
-  return 'Faster answers scored a little better — your first instincts were onto something.';
 }
 
 // Clipboard helper with a tiny visible confirmation state.
@@ -1405,15 +1383,6 @@ function ArcChart({ userTurns, seed, activeIdx, setActiveIdx, longestPause }) {
 
   const active = typeof activeIdx === 'number' ? userTurns[activeIdx] : null;
 
-  // Claude's words to label above the axis (including the seed at t=0).
-  const claudeWords = [];
-  if (seed) claudeWords.push({ word: seed, atMs: 0, isSeed: true });
-  userTurns.forEach(t => {
-    if (t.claudeReply && typeof t.claudeAt === 'number') {
-      claudeWords.push({ word: t.claudeReply, atMs: t.claudeAt });
-    }
-  });
-
   return (
     <div style={{
       padding: 'clamp(20px, 2.4vw, 28px)',
@@ -1421,22 +1390,6 @@ function ArcChart({ userTurns, seed, activeIdx, setActiveIdx, longestPause }) {
       border: '1px solid var(--line)',
       borderRadius: 3,
     }}>
-      {/* Legend */}
-      <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', marginBottom: 10, alignItems: 'center' }}>
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-          <span style={{ width: 18, height: 2, background: 'var(--moss)' }}/>
-          <span className="mono" style={{ fontSize: 10, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--stone)', fontWeight: 500 }}>quality</span>
-        </span>
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-          <span style={{ width: 5, height: 12, background: 'var(--user-line)', borderRadius: 1 }}/>
-          <span className="mono" style={{ fontSize: 10, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--stone)', fontWeight: 500 }}>seconds (√-scaled)</span>
-        </span>
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-          <span style={{ width: 14, height: 10, background: 'var(--moss-soft)', opacity: 0.6 }}/>
-          <span className="mono" style={{ fontSize: 10, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--stone)', fontWeight: 500 }}>goldilocks 70–89</span>
-        </span>
-      </div>
-
       <div style={{ position: 'relative' }}>
         <svg viewBox={`0 0 ${W} ${H}`} width="100%" style={{ display: 'block', overflow: 'visible' }}
           role="img" aria-label="Quality of each word over the two minutes">
@@ -1508,39 +1461,29 @@ function ArcChart({ userTurns, seed, activeIdx, setActiveIdx, longestPause }) {
             </text>
           )}
 
-          {/* Claude reply labels above axis */}
-          {claudeWords.map((c, i) => {
-            const x = xAt(c.atMs);
-            return (
-              <g key={`cw-${i}`}>
-                <circle cx={x} cy={axisY} r="2.6"
-                  fill="var(--paper)" stroke="var(--claude-line)" strokeWidth="1.2"/>
-                <text x={x} y={axisY - 6} fontSize="10"
-                  fill="var(--claude-ink)" textAnchor="middle" fontStyle="italic"
-                  fontFamily="Lora, Georgia, serif" opacity="0.62">
-                  {c.word}
-                </text>
-              </g>
-            );
-          })}
-
           {/* User word dots + connectors */}
           {userTurns.map((t, i) => {
             const x = xAt(t.atMs);
             const y = qualityY(t.quality);
             const isStandout = t.isStandout;
-            const isWeakest = t.isWeakest;
             const isActive = activeIdx === i;
-            const r = isActive ? 7 : (isStandout || isWeakest ? 5.4 : 4);
             const color = qualityColor(t.quality);
+            const r = isStandout ? 8 : (isActive ? 7 : 4);
             return (
               <g key={`u-${i}`}>
+                {isStandout && (
+                  <circle cx={x} cy={y} r="14"
+                    fill="var(--moss-deep)" opacity="0.18"/>
+                )}
                 <line x1={x} y1={axisY} x2={x} y2={y}
                   stroke={color} strokeWidth="1" opacity={isActive ? 0.45 : 0.22}/>
                 <circle cx={x} cy={y} r={r}
-                  fill="var(--paper)" stroke={color} strokeWidth="1.7"/>
-                <circle cx={x} cy={y} r={Math.max(1.5, r - 2)}
-                  fill={color} opacity={isStandout ? 1 : 0.82}/>
+                  fill={isStandout ? 'var(--moss-deep)' : 'var(--paper)'}
+                  stroke={isStandout ? 'var(--moss-deep)' : color} strokeWidth="1.7"/>
+                {!isStandout && (
+                  <circle cx={x} cy={y} r={Math.max(1.5, r - 2)}
+                    fill={color} opacity="0.82"/>
+                )}
                 {t.isRepeat && (
                   <circle cx={x} cy={y} r={r + 3} fill="none"
                     stroke="var(--clay)" strokeWidth="1" strokeDasharray="2 2" opacity="0.7"/>
@@ -1624,102 +1567,14 @@ function ArcChart({ userTurns, seed, activeIdx, setActiveIdx, longestPause }) {
   );
 }
 
-// Compact scatter showing time-vs-quality and the resulting insight.
-function TimeQualityScatter({ userTurns }) {
-  if (userTurns.length < 3) return null;
-  const xs = userTurns.map(t => t.timeMs/1000);
-  const ys = userTurns.map(t => t.quality);
-  const r = correlation(xs, ys);
-  const insight = timeQualityInsight(r);
-
-  const W = 520, H = 180;
-  const PAD_L = 32, PAD_R = 14, PAD_T = 10, PAD_B = 28;
-  const maxX = Math.max(6, ...xs);
-  const plotW = W - PAD_L - PAD_R;
-  const plotH = H - PAD_T - PAD_B;
-  const xAt = (s) => PAD_L + (plotW * s) / maxX;
-  const yAt = (q) => PAD_T + plotH * (1 - q/100);
-
-  // Least-squares trendline.
-  const n = xs.length;
-  const mx = xs.reduce((a,b)=>a+b,0)/n;
-  const my = ys.reduce((a,b)=>a+b,0)/n;
-  let num = 0, den = 0;
-  xs.forEach((x,i) => { num += (x-mx)*(ys[i]-my); den += (x-mx)*(x-mx); });
-  const slope = den ? num/den : 0;
-  const intercept = my - slope*mx;
-  const y0 = Math.max(0, Math.min(100, intercept));
-  const yM = Math.max(0, Math.min(100, slope*maxX + intercept));
-
-  return (
-    <div style={{
-      padding: 'clamp(20px, 2.4vw, 28px)',
-      background: 'rgba(255,252,241,0.5)',
-      border: '1px solid var(--line)',
-      borderRadius: 3,
-    }}>
-      <div className="mono" style={{
-        fontSize: 10, letterSpacing: '0.2em', textTransform: 'uppercase',
-        color: 'var(--stone)', fontWeight: 500, marginBottom: 14,
-      }}>
-        time vs. quality
-      </div>
-      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(260px, 1.2fr) minmax(220px, 1fr)', gap: 24, alignItems: 'center' }}>
-        <svg viewBox={`0 0 ${W} ${H}`} width="100%"
-          role="img" aria-label={`Scatter of quality vs seconds. Correlation ${r.toFixed(2)}`}>
-          <line x1={PAD_L} y1={H-PAD_B} x2={W-PAD_R} y2={H-PAD_B} stroke="var(--line)" strokeWidth="1"/>
-          <line x1={PAD_L} y1={PAD_T} x2={PAD_L} y2={H-PAD_B} stroke="var(--line)" strokeWidth="1"/>
-          {[0,50,100].map(q => (
-            <g key={q}>
-              <line x1={PAD_L-3} y1={yAt(q)} x2={PAD_L} y2={yAt(q)} stroke="var(--line)" strokeWidth="1"/>
-              <text x={PAD_L-6} y={yAt(q)+3} fontSize="9" textAnchor="end"
-                fill="var(--stone)" fontFamily="Geist Mono, ui-monospace, monospace"
-                fontVariantNumeric="tabular-nums">{q}</text>
-            </g>
-          ))}
-          {[0, Math.round(maxX/2), Math.round(maxX)].map(s => (
-            <g key={s}>
-              <line x1={xAt(s)} y1={H-PAD_B} x2={xAt(s)} y2={H-PAD_B+3} stroke="var(--line)" strokeWidth="1"/>
-              <text x={xAt(s)} y={H-PAD_B+14} fontSize="9" textAnchor="middle"
-                fill="var(--stone)" fontFamily="Geist Mono, ui-monospace, monospace"
-                fontVariantNumeric="tabular-nums">{s}s</text>
-            </g>
-          ))}
-          {Math.abs(r) >= 0.2 && (
-            <line x1={xAt(0)} y1={yAt(y0)} x2={xAt(maxX)} y2={yAt(yM)}
-              stroke="var(--moss-deep)" strokeWidth="1.3" opacity="0.55" strokeDasharray="3 3"/>
-          )}
-          {userTurns.map((t, i) => (
-            <circle key={i} cx={xAt(t.timeMs/1000)} cy={yAt(t.quality)} r="3.4"
-              fill={qualityColor(t.quality)} opacity="0.85"/>
-          ))}
-        </svg>
-        <div>
-          <div className="serif" style={{
-            fontSize: 16, lineHeight: 1.5, color: 'var(--ink)', fontStyle: 'italic',
-            marginBottom: 8,
-          }}>
-            {insight}
-          </div>
-          <div className="mono" style={{
-            fontSize: 10, color: 'var(--stone)', letterSpacing: '0.14em',
-            textTransform: 'uppercase',
-          }}>
-            correlation <span style={{ fontVariantNumeric: 'tabular-nums', marginLeft: 4 }}>r = {r.toFixed(2)}</span>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 // Chronological single-column cards. Shares activeIdx with the arc chart.
-function ExchangeCards({ userTurns, activeIdx, setActiveIdx }) {
+function ExchangeCards({ userTurns, activeIdx, setActiveIdx, weakestAlt }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
       {userTurns.map((t, i) => {
         const isStandout = t.isStandout;
         const isWeakest = t.isWeakest;
+        const showAlt = isWeakest && weakestAlt;
         const isActive = activeIdx === i;
         const bandColor = qualityColor(t.quality);
         return (
@@ -1792,6 +1647,14 @@ function ExchangeCards({ userTurns, activeIdx, setActiveIdx }) {
                   {t.reason}
                 </div>
               )}
+              {showAlt && (
+                <div className="mono" style={{
+                  fontSize: 11, color: 'var(--moss-deep)', marginTop: 6,
+                  letterSpacing: '0.04em',
+                }}>
+                  try: <span style={{ fontWeight: 600 }}>{weakestAlt}</span>
+                </div>
+              )}
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 2 }}>
               <span className="mono" style={{
@@ -1816,10 +1679,10 @@ function ExchangeCards({ userTurns, activeIdx, setActiveIdx }) {
 
 function timeHint(s) {
   if (!s || isNaN(s)) return '';
-  if (s < 2) return 'barely a breath between';
-  if (s < 5) return 'one breath between';
-  if (s < 9) return 'considered';
-  return 'you took your time';
+  if (s < 2) return 'quick instincts';
+  if (s < 4) return 'steady pace';
+  if (s < 7) return 'considered';
+  return 'took your time';
 }
 
 // ---------- Tweaks ----------
