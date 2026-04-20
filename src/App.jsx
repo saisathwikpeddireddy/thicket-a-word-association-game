@@ -762,7 +762,6 @@ function TrailWord({ word, who, index }) {
 function EndScreen({ rounds, avgResponseMs, seed, onRestart }) {
   const [scoreData, setScoreData] = useState(null);
   const [scoring, setScoring] = useState(true);
-  const [shareState, setShareState] = useState('idle'); // idle | copied | failed
 
   useEffect(() => {
     let cancelled = false;
@@ -808,13 +807,6 @@ function EndScreen({ rounds, avgResponseMs, seed, onRestart }) {
     ? userRounds[scoreData.standoutIdx] : null;
   const standoutPrev = standoutRound ? prevAiFor(standoutRound) : null;
 
-  const handleShare = async () => {
-    const text = buildShareText({ rounds, seed, scoreData, avgResponseMs });
-    const ok = await copyToClipboard(text);
-    setShareState(ok ? 'copied' : 'failed');
-    setTimeout(() => setShareState('idle'), 1800);
-  };
-
   return (
     <div style={{
       minHeight: '100vh', overflow: 'auto',
@@ -844,30 +836,42 @@ function EndScreen({ rounds, avgResponseMs, seed, onRestart }) {
           display: 'grid',
           gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
           gap: 'clamp(10px, 1.5vw, 16px)',
-          marginBottom: 44,
+          marginBottom: 36,
         }}>
           <Stat
             label="avg per turn"
             value={`${avgSec}s`}
+            delay={60}
           />
           <Stat
             label="fastest reply"
             value={fastest?.user || '—'}
             sub={fastest && fastestPrev ? `${(fastest.userMs/1000).toFixed(1)}s · from ${fastestPrev}` : (fastest ? `${(fastest.userMs/1000).toFixed(1)}s` : '')}
+            delay={140}
           />
           <Stat
             label="best leap"
             value={scoreData?.standout || '…'}
             sub={scoreData && standoutPrev && scoreData.standout ? `${standoutPrev} → ${scoreData.standout}` : ''}
             loading={scoring}
+            accent
+            delay={220}
           />
           <Stat
             label="goldilocks zone"
             value={scoreData ? `${scoreData.goldilocksCount} of ${n}` : '…'}
             sub="replies that really landed"
             loading={scoring}
+            delay={300}
           />
         </div>
+
+        {/* The trail — full word journey, with the best leap pair highlighted */}
+        <TrailJourney
+          rounds={rounds}
+          seed={seed}
+          standoutIdx={scoreData?.standoutIdx ?? -1}
+        />
 
         {/* Short feedback note */}
         <div style={{ marginBottom: 40, maxWidth: 680 }}>
@@ -907,42 +911,136 @@ function EndScreen({ rounds, avgResponseMs, seed, onRestart }) {
           >
             Another round
           </button>
-          <button onClick={handleShare} disabled={scoring} style={{
-            background: 'transparent', color: 'var(--ink-soft)',
-            border: '1px solid var(--line)',
-            padding: '13px 22px',
-            fontFamily: 'inherit', fontSize: 15, fontWeight: 500, letterSpacing: '0.02em',
-            cursor: scoring ? 'default' : 'pointer', borderRadius: 2,
-            opacity: scoring ? 0.4 : 1,
-            transition: 'color 300ms ease, border-color 300ms ease',
-          }}>
-            {shareState === 'copied' ? 'copied ✓' : shareState === 'failed' ? 'copy failed' : 'Share trail'}
-          </button>
         </div>
       </div>
     </div>
   );
 }
 
+// Visual walk of the whole round: seed → user → claude → user → claude …
+// The best-leap pair (claude word that sparked the standout reply + the
+// standout reply itself) is highlighted in a soft moss pill. Each chip
+// staggers in so it reads like the trail being laid down.
+function TrailJourney({ rounds, seed, standoutIdx }) {
+  // Build a flat list of chips with their kind and original user-index (if user).
+  const items = [];
+  if (seed) items.push({ word: seed, kind: 'seed' });
+  let userCount = 0;
+  rounds.forEach(r => {
+    if (r.user) {
+      items.push({ word: r.user, kind: 'user', userIdx: userCount });
+      userCount++;
+    }
+    if (r.claude) items.push({ word: r.claude, kind: 'claude' });
+  });
+
+  const bestIdx = standoutIdx >= 0
+    ? items.findIndex(it => it.kind === 'user' && it.userIdx === standoutIdx)
+    : -1;
+  const bestPrevIdx = bestIdx > 0 ? bestIdx - 1 : -1;
+
+  return (
+    <div style={{ marginBottom: 40 }}>
+      <div className="mono" style={{
+        fontSize: 12, letterSpacing: '0.2em', textTransform: 'uppercase',
+        color: 'var(--stone)', marginBottom: 14, fontWeight: 500,
+        display: 'flex', alignItems: 'center', gap: 8,
+      }}>
+        <span>the trail</span>
+        <div style={{ flex: 1, height: 1, background: 'var(--line)', maxWidth: 160 }}/>
+        {bestIdx >= 0 && (
+          <span style={{ color: 'var(--moss-soft)', fontSize: 10, letterSpacing: '0.15em' }}>
+            best leap highlighted
+          </span>
+        )}
+      </div>
+      <div style={{
+        display: 'flex', flexWrap: 'wrap', alignItems: 'center',
+        gap: '10px 10px',
+        padding: '20px 22px',
+        border: '1px solid var(--line)',
+        background: 'rgba(255,252,241,0.4)',
+        borderRadius: 3,
+        lineHeight: 1.4,
+      }}>
+        {items.map((it, i) => {
+          const highlighted = i === bestIdx || i === bestPrevIdx;
+          const isClaude = it.kind === 'claude';
+          const isSeed = it.kind === 'seed';
+          const delay = 120 + i * 55;
+          return (
+            <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 10 }}>
+              <span
+                className="serif"
+                style={{
+                  fontSize: highlighted
+                    ? 'clamp(19px, 2.2vw, 23px)'
+                    : 'clamp(16px, 1.8vw, 19px)',
+                  fontStyle: isClaude ? 'var(--claude-style, italic)' : 'normal',
+                  fontWeight: highlighted ? 500 : 400,
+                  color: highlighted
+                    ? 'var(--moss-deep)'
+                    : (isClaude ? 'var(--claude-ink)' : (isSeed ? 'var(--stone)' : 'var(--ink)')),
+                  background: highlighted ? 'rgba(122,136,100,0.22)' : 'transparent',
+                  padding: highlighted ? '3px 11px' : '0',
+                  borderRadius: highlighted ? 14 : 0,
+                  letterSpacing: '-0.005em',
+                  opacity: 0,
+                  transform: 'translateY(6px)',
+                  animation: `fade-in 520ms ease ${delay}ms forwards`,
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {it.word}
+              </span>
+              {i < items.length - 1 && (
+                <span
+                  className="mono"
+                  style={{
+                    color: 'var(--stone-2)',
+                    fontSize: 12,
+                    opacity: 0,
+                    animation: `fade-in 520ms ease ${delay + 30}ms forwards`,
+                  }}
+                >
+                  →
+                </span>
+              )}
+            </span>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 // Single stat card. `loading` dims the value while the scorer is still running.
-function Stat({ label, value, sub, loading }) {
+// `accent` gives a card a soft moss tint (used for the best-leap highlight).
+// `delay` staggers the reveal animation.
+function Stat({ label, value, sub, loading, accent, delay = 0 }) {
   return (
     <div style={{
       padding: '18px 20px',
-      border: '1px solid var(--line)',
-      background: 'rgba(255,252,241,0.5)',
+      border: accent ? '1px solid var(--claude-line)' : '1px solid var(--line)',
+      background: accent ? 'rgba(92,107,71,0.08)' : 'rgba(255,252,241,0.5)',
       borderRadius: 3,
       display: 'flex', flexDirection: 'column', gap: 8,
       minHeight: 96,
+      opacity: 0,
+      transform: 'translateY(10px)',
+      animation: `fade-in 600ms ease ${delay}ms forwards`,
     }}>
       <div className="mono" style={{
         fontSize: 10, letterSpacing: '0.2em', textTransform: 'uppercase',
-        color: 'var(--stone)', fontWeight: 500,
+        color: accent ? 'var(--moss-deep)' : 'var(--stone)',
+        fontWeight: 500,
       }}>
         {label}
       </div>
       <div className="serif" style={{
-        fontSize: 'clamp(22px, 2.6vw, 28px)', color: 'var(--ink)', fontWeight: 400,
+        fontSize: 'clamp(22px, 2.6vw, 28px)',
+        color: accent ? 'var(--moss-deep)' : 'var(--ink)',
+        fontWeight: 400,
         letterSpacing: '-0.01em', lineHeight: 1.1,
         fontVariantNumeric: 'tabular-nums',
         opacity: loading ? 0.35 : 1,
@@ -964,49 +1062,6 @@ function Stat({ label, value, sub, loading }) {
       )}
     </div>
   );
-}
-
-// Clipboard helper with a tiny visible confirmation state.
-async function copyToClipboard(text) {
-  try {
-    if (navigator?.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text);
-      return true;
-    }
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    ta.style.position = 'fixed';
-    ta.style.opacity = '0';
-    document.body.appendChild(ta);
-    ta.select();
-    const ok = document.execCommand('copy');
-    document.body.removeChild(ta);
-    return ok;
-  } catch { return false; }
-}
-
-function buildShareText({ rounds, seed, scoreData, avgResponseMs }) {
-  const n = rounds.filter(r => r.user && r.claude).length;
-  const lines = [];
-  lines.push(`Thicket — word association`);
-  const metaParts = [`${n} turns`, `avg ${(avgResponseMs/1000).toFixed(1)}s`];
-  if (scoreData && typeof scoreData.goldilocksCount === 'number') {
-    metaParts.push(`${scoreData.goldilocksCount} in the Goldilocks zone`);
-  }
-  lines.push(metaParts.join(' · '));
-  lines.push('');
-  const trail = [];
-  if (seed) trail.push(seed);
-  rounds.forEach(r => {
-    if (r.user) trail.push(r.user);
-    if (r.claude) trail.push(r.claude);
-  });
-  lines.push(trail.join(' → '));
-  if (scoreData?.standout) {
-    lines.push('');
-    lines.push(`best leap: ${scoreData.standout}`);
-  }
-  return lines.join('\n');
 }
 
 // ---------- Tweaks ----------
