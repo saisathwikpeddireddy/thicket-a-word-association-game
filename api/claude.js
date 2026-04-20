@@ -1,16 +1,16 @@
 // Vercel serverless function that proxies to the Anthropic API.
-// Uses Haiku (cheap/fast) for per-turn word generation and Sonnet for
-// the post-game Goldilocks scoring/coaching pass.
+// Uses Haiku for both per-turn word generation and the compact end-screen
+// scoring pass (four fields only — fast and cheap).
 
 const MODELS = {
   word: 'claude-haiku-4-5-20251001',
-  score: 'claude-sonnet-4-5',
+  score: 'claude-haiku-4-5-20251001',
 };
 
-// Higher token budget on scoring now that per-word reasons are returned.
+// Scoring output is small now (4 fields, ~80 tokens typical).
 const MAX_TOKENS = {
   word: 20,
-  score: 2200,
+  score: 400,
 };
 
 // Deterministic scoring; playful word generation.
